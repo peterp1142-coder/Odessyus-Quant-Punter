@@ -1,6 +1,6 @@
 {
   "name": "odessyus-agent",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Odessyus - Autonomous ReAct-Driven Sports Forecasting & Betting Agent",
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "build": "npm run build:all",
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
-    "build:browser": "cd browser && npm install --no-audit --no-fund && npx puppeteer browsers install chrome && mkdir -p /opt/render/project/.chrome && cp -R /opt/render/.cache/puppeteer/chrome /opt/render/project/.chrome/",
+    "build:browser": "cd browser && npm install --no-audit --no-fund && npx puppeteer browsers install chrome",
     "build:all": "npm run build:browser && npm run build:client && npm run build:server",
     "preview": "vite preview",
     "start": "npm run build:server && export PUPPETEER_EXECUTABLE_PATH=\"$(node -e \"console.log(require('./browser/node_modules/puppeteer').executablePath())\")\" && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node dist-server/index.js"
