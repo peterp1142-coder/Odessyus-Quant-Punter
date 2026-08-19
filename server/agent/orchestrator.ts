@@ -15,48 +15,42 @@ interface AgentPlan { reasoning: string; agents: AgentTask[]; }
 export interface OrchestratorResult { finalAnswer: string; steps: ReActStep[]; success: boolean; error?: string; metadata: any; }
 interface DiscoveredFixture { fixture: string; kickoff?: string; status?: string; }
 
+const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
+function marketToday(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
 function isTodayOrFuture(kickoff: string | undefined, requestedDate: string): boolean {
   if (!kickoff) return false;
   const d = new Date(kickoff);
   if (Number.isNaN(d.getTime())) return false;
-  const now = Date.now();
-  // A fixture is eligible only while it is still in the future. A small 2-minute
-  // clock-skew tolerance prevents rejecting a genuinely upcoming match because
-  // the provider and server clocks differ slightly.
-  return d.getTime() > now - 120_000 && d.toISOString().slice(0, 10) === requestedDate;
+  return d.getTime() > Date.now() - 120_000 && d.toLocaleDateString('en-CA', { timeZone: MARKET_TIMEZONE }) === requestedDate;
 }
 
 function isCompletedStatus(status: string | undefined): boolean {
   const s = String(status || '').toLowerCase().trim();
-  if (!s) return false;
-  return /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover/.test(s);
+  return !!s && /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s);
 }
 
 async function discoverFixtures(userQuery: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
   const { fetchMatchesToday } = await import('./tools.js');
-  onStep({ type: 'status', content: `🔍 Fetching real ${sport} fixtures for ${matchDate}…`, timestamp: new Date().toISOString() });
+  onStep({ type: 'status', content: `🔍 Fetching real ${sport} fixtures for ${matchDate} in ${MARKET_TIMEZONE}…`, timestamp: new Date().toISOString() });
   const r = await fetchMatchesToday(sport, matchDate);
   if (!r.success || !r.data) return { fixtures: [], rawSchedule: '' };
   try {
     const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
-      { role: 'system', content: 'You are a fixture gatekeeper. Extract only REAL, scheduled, NOT-YET-STARTED fixtures for the requested calendar date. Never return a finished, live, postponed, cancelled or already-started match. Return JSON only.' },
-      { role: 'user', content: `User query: ${userQuery}\nRequested date: ${matchDate}\nCurrent UTC time: ${new Date().toISOString()}\nSchedule:\n${r.data.substring(0, 10000)}\nReturn 6-10 exact relevant FUTURE fixtures as {"fixtures":[{"fixture":"Home vs Away","kickoff":"YYYY-MM-DDTHH:mm:ssZ","status":"scheduled"}]}. The kickoff MUST be later than the current UTC time and on ${matchDate}. If a match has already started or finished, OMIT it. If kickoff cannot be verified, OMIT it. Never invent fixtures, kickoff times or statuses.` }
+      { role: 'system', content: 'You are a strict fixture gatekeeper. Extract only REAL, scheduled, NOT-YET-STARTED fixtures for the requested calendar date. Never return a finished, live, postponed, cancelled or already-started match. Return JSON only.' },
+      { role: 'user', content: `User query: ${userQuery}\nRequested market-local date: ${matchDate}\nMarket timezone: ${MARKET_TIMEZONE}\nCurrent UTC time: ${new Date().toISOString()}\nSchedule:\n${r.data.substring(0, 10000)}\nReturn 6-10 exact relevant FUTURE fixtures as {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601 timestamp with timezone/UTC","status":"scheduled"}]}. The kickoff MUST be later than current time and must fall on ${matchDate} in ${MARKET_TIMEZONE}. If a match has already started, is live, finished, postponed, cancelled, or its kickoff cannot be verified, OMIT it. Never invent fixtures, kickoff times or statuses.` }
     ] as any, temperature: 0, maxTokens: 900 }));
     const raw = x.choices?.[0]?.message?.content || '';
     const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
     if (m) {
       const p = JSON.parse(m[0]) as { fixtures?: DiscoveredFixture[] };
       const fixtures = Array.isArray(p.fixtures)
-        ? p.fixtures
-            .filter(v => v && typeof v.fixture === 'string')
-            .filter(v => !isCompletedStatus(v.status))
-            .filter(v => isTodayOrFuture(v.kickoff, matchDate))
-            .map(v => v.fixture.trim())
-            .filter(s => s.length > 5)
-            .filter((s, i, a) => a.indexOf(s) === i)
+        ? p.fixtures.filter(v => v && typeof v.fixture === 'string').filter(v => !isCompletedStatus(v.status)).filter(v => isTodayOrFuture(v.kickoff, matchDate)).map(v => v.fixture.trim()).filter(s => s.length > 5).filter((s, i, a) => a.indexOf(s) === i)
         : [];
       if (fixtures.length) {
-        onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} verified future fixtures. Finished/live/stale matches were excluded before any specialist analysis.`, timestamp: new Date().toISOString() });
+        onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} verified future fixtures. Finished/live/stale matches were excluded before specialist analysis.`, timestamp: new Date().toISOString() });
         return { fixtures, rawSchedule: r.data };
       }
       onStep({ type: 'error', content: `⚠️ No fixtures passed the future-match gate for ${matchDate}. Refusing to analyse stale/expired matches.`, timestamp: new Date().toISOString() });
@@ -77,11 +71,11 @@ async function parseQuery(userQuery: string) {
     const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
     if (m) {
       const p = JSON.parse(m[0]) as any;
-      const requested = p.matchDate === 'today' ? new Date().toISOString().slice(0, 10) : (p.matchDate || new Date().toISOString().slice(0, 10));
+      const requested = p.matchDate === 'today' ? marketToday() : (p.matchDate || marketToday());
       return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: requested };
     }
   } catch { /* safe defaults */ }
-  return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: new Date().toISOString().slice(0, 10) };
+  return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: marketToday() };
 }
 
 async function buildPlan(_userQuery: string, fixture: string, _sport: string, _market: string): Promise<AgentPlan> {
