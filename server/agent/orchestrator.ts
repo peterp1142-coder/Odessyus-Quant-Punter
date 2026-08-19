@@ -13,6 +13,24 @@ type AgentName = 'OddsScout' | 'FormScout' | 'InjuryIntel' | 'SentimentAgent' | 
 interface AgentTask { name: AgentName; focus: string; required: boolean; tier: 1 | 2 | 3; }
 interface AgentPlan { reasoning: string; agents: AgentTask[]; }
 export interface OrchestratorResult { finalAnswer: string; steps: ReActStep[]; success: boolean; error?: string; metadata: any; }
+interface DiscoveredFixture { fixture: string; kickoff?: string; status?: string; }
+
+function isTodayOrFuture(kickoff: string | undefined, requestedDate: string): boolean {
+  if (!kickoff) return false;
+  const d = new Date(kickoff);
+  if (Number.isNaN(d.getTime())) return false;
+  const now = Date.now();
+  // A fixture is eligible only while it is still in the future. A small 2-minute
+  // clock-skew tolerance prevents rejecting a genuinely upcoming match because
+  // the provider and server clocks differ slightly.
+  return d.getTime() > now - 120_000 && d.toISOString().slice(0, 10) === requestedDate;
+}
+
+function isCompletedStatus(status: string | undefined): boolean {
+  const s = String(status || '').toLowerCase().trim();
+  if (!s) return false;
+  return /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover/.test(s);
+}
 
 async function discoverFixtures(userQuery: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
   const { fetchMatchesToday } = await import('./tools.js');
@@ -21,20 +39,31 @@ async function discoverFixtures(userQuery: string, sport: string, matchDate: str
   if (!r.success || !r.data) return { fixtures: [], rawSchedule: '' };
   try {
     const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
-      { role: 'system', content: 'Extract real fixtures from the supplied schedule. Return JSON only.' },
-      { role: 'user', content: `User query: ${userQuery}\nDate: ${matchDate}\nSchedule:\n${r.data.substring(0, 7000)}\nReturn 6-10 exact relevant fixtures as {"fixtures":["Home vs Away",...]}. Never invent fixtures.` }
-    ] as any, temperature: 0, maxTokens: 500 }));
+      { role: 'system', content: 'You are a fixture gatekeeper. Extract only REAL, scheduled, NOT-YET-STARTED fixtures for the requested calendar date. Never return a finished, live, postponed, cancelled or already-started match. Return JSON only.' },
+      { role: 'user', content: `User query: ${userQuery}\nRequested date: ${matchDate}\nCurrent UTC time: ${new Date().toISOString()}\nSchedule:\n${r.data.substring(0, 10000)}\nReturn 6-10 exact relevant FUTURE fixtures as {"fixtures":[{"fixture":"Home vs Away","kickoff":"YYYY-MM-DDTHH:mm:ssZ","status":"scheduled"}]}. The kickoff MUST be later than the current UTC time and on ${matchDate}. If a match has already started or finished, OMIT it. If kickoff cannot be verified, OMIT it. Never invent fixtures, kickoff times or statuses.` }
+    ] as any, temperature: 0, maxTokens: 900 }));
     const raw = x.choices?.[0]?.message?.content || '';
     const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
     if (m) {
-      const p = JSON.parse(m[0]) as { fixtures?: string[] };
-      const fixtures = Array.isArray(p.fixtures) ? [...new Set(p.fixtures.map(String).map(s => s.trim()).filter(s => s.length > 5))] : [];
+      const p = JSON.parse(m[0]) as { fixtures?: DiscoveredFixture[] };
+      const fixtures = Array.isArray(p.fixtures)
+        ? p.fixtures
+            .filter(v => v && typeof v.fixture === 'string')
+            .filter(v => !isCompletedStatus(v.status))
+            .filter(v => isTodayOrFuture(v.kickoff, matchDate))
+            .map(v => v.fixture.trim())
+            .filter(s => s.length > 5)
+            .filter((s, i, a) => a.indexOf(s) === i)
+        : [];
       if (fixtures.length) {
-        onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} real fixtures — each will be analysed independently and asynchronously.`, timestamp: new Date().toISOString() });
+        onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} verified future fixtures. Finished/live/stale matches were excluded before any specialist analysis.`, timestamp: new Date().toISOString() });
         return { fixtures, rawSchedule: r.data };
       }
+      onStep({ type: 'error', content: `⚠️ No fixtures passed the future-match gate for ${matchDate}. Refusing to analyse stale/expired matches.`, timestamp: new Date().toISOString() });
     }
-  } catch { /* safe fallback */ }
+  } catch (e) {
+    onStep({ type: 'error', content: `⚠️ Fixture validation failed; stale fixtures will not be analysed. ${e instanceof Error ? e.message : String(e)}`, timestamp: new Date().toISOString() });
+  }
   return { fixtures: [], rawSchedule: r.data };
 }
 
@@ -48,7 +77,8 @@ async function parseQuery(userQuery: string) {
     const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
     if (m) {
       const p = JSON.parse(m[0]) as any;
-      return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: p.matchDate || new Date().toISOString().slice(0, 10) };
+      const requested = p.matchDate === 'today' ? new Date().toISOString().slice(0, 10) : (p.matchDate || new Date().toISOString().slice(0, 10));
+      return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: requested };
     }
   } catch { /* safe defaults */ }
   return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: new Date().toISOString().slice(0, 10) };
@@ -56,7 +86,7 @@ async function parseQuery(userQuery: string) {
 
 async function buildPlan(_userQuery: string, fixture: string, _sport: string, _market: string): Promise<AgentPlan> {
   return { reasoning: 'Full evidence roster with fixture-level asynchronous fan-out.', agents: [
-    { name: 'OddsScout', focus: `Find verified odds and line movement for ${fixture}`, required: true, tier: 1 },
+    { name: 'OddsScout', focus: `Find verified odds and line movement for ${fixture}. Reject odds for finished/live/stale fixtures.`, required: true, tier: 1 },
     { name: 'FormScout', focus: `Find form, H2H, xG and performance data for ${fixture}`, required: true, tier: 1 },
     { name: 'InjuryIntel', focus: `Find injuries, suspensions and availability for ${fixture}`, required: true, tier: 2 },
     { name: 'SentimentAgent', focus: `Find team news, weather, referee and motivation for ${fixture}`, required: false, tier: 2 },
@@ -104,7 +134,10 @@ export async function runOrchestrator(userQuery: string, sessionId: string, onSt
     fixtures = d.fixtures; schedule = d.rawSchedule;
     if (fixtures.length) fixture = fixtures.join(' | ');
   }
-  const scheduleContext = schedule ? `=== VERIFIED SCHEDULE ===\n${schedule.substring(0, 5000)}\n=== END SCHEDULE ===` : '';
+  if (!fixtures.length && (fixture === 'multiple/open' || fixture === userQuery)) {
+    return { finalAnswer: `NO QUALIFIED FIXTURES: I could not verify any future, not-yet-started fixtures for ${matchDate}. I will not analyse stale or already-played matches.`, steps, success: true, metadata: { fixture, sport, market, matchDate, agentsRun: [] } };
+  }
+  const scheduleContext = schedule ? `=== VERIFIED SCHEDULE — ${matchDate} ===\n${schedule.substring(0, 5000)}\n=== END SCHEDULE ===` : '';
   const plan = await buildPlan(userQuery, fixture, sport, market);
   const acc: Record<string, SubAgentResult> = {};
   const agentsRun: string[] = [];
