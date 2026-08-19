@@ -24,8 +24,6 @@ function isoForMarketDate(date: string, time: string, timeZone: string): string 
   const second = Number(m[3] || 0);
   if (hour > 23 || minute > 59 || second > 59) return null;
 
-  // Use Intl to derive the UTC offset for the requested market timezone.
-  // The conversion is deliberately deterministic and handles DST zones.
   const probe = new Date(`${date}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}Z`);
   if (Number.isNaN(probe.getTime())) return null;
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -59,14 +57,12 @@ export function extractFixtureCandidates(text: string, matchDate: string, timeZo
   const seen = new Set<string>();
   const input = text.replace(/\r/g, '\n');
 
-  // Canonical AllSports output: date time | home vs away | league (...)
   const allSports = new RegExp(`${escapeRegExp(matchDate)}\\s+(\\d{1,2}:\\d{2}(?::\\d{2})?)\\s*\\|\\s*([^|\\n]+?)\\s+vs\\s+([^|\\n]+?)\\s*\\|\\s*([^\\n(]+)`, 'gi');
   for (const m of input.matchAll(allSports)) {
     const kickoff = isoForMarketDate(matchDate, m[1], timeZone);
     if (kickoff) addCandidate(out, seen, `${m[2]} vs ${m[3]}`, kickoff, source, cleanTeam(m[4]));
   }
 
-  // Search/browser text: explicit "Home vs Away" followed or preceded by a time.
   const explicitVs = new RegExp(`([^\\n|]{2,80}?)\\s+(?:vs\\.?|v\\.?)\\s+([^\\n|]{2,80}?)\\s+(?:[-|•·]?\\s*)?(\\d{1,2}:\\d{2})\\b`, 'gi');
   for (const m of input.matchAll(explicitVs)) {
     const kickoff = isoForMarketDate(matchDate, m[3], timeZone);
@@ -79,7 +75,6 @@ export function extractFixtureCandidates(text: string, matchDate: string, timeZo
     if (kickoff) addCandidate(out, seen, `${m[2]} vs ${m[3]}`, kickoff, source);
   }
 
-  // Common score-site layout: Home - Away with a nearby kickoff time on the same line.
   const dashLayout = new RegExp(`([^\\n|]{2,70}?)\\s+(?:-|–|—)\\s+([^\\n|]{2,70}?)\\s+.*?\\b(\\d{1,2}:\\d{2})\\b`, 'gi');
   for (const m of input.matchAll(dashLayout)) {
     const kickoff = isoForMarketDate(matchDate, m[3], timeZone);
@@ -90,5 +85,17 @@ export function extractFixtureCandidates(text: string, matchDate: string, timeZo
 }
 
 export function serializeFixtureCandidates(candidates: FixtureCandidate[]): string {
-  return JSON.stringify({ fixtures: candidates.map(({ fixture, kickoff, status, competition }) => ({ fixture, kickoff, status, competition })) });
+  return JSON.stringify({
+    fixtures: candidates.map(({ fixture, kickoff, status, competition }) => {
+      const [home, away] = fixture.split(/\s+vs\s+/i);
+      return {
+        fixture,
+        homeTeam: { name: home },
+        awayTeam: { name: away },
+        kickoff,
+        status,
+        competition: competition ? { name: competition } : undefined,
+      };
+    }),
+  });
 }
