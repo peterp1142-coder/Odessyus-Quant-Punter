@@ -6,58 +6,51 @@ I want you to build a HIGH-QUALITY accumulator from today's available football f
 IMPORTANT:
 - Do NOT force a bet.
 - Do NOT select matches simply because they are favourites.
-- Do NOT invent fixtures, odds, injuries, lineups, or statistics.
-- Analyse every discovered fixture independently first, in parallel where possible, then construct the accumulator only from the strongest qualified selections.
-- The objective is NOT maximum number of legs. The objective is the best risk-adjusted expected value.
-- Prefer fewer high-quality legs over a large accumulator full of marginal selections.
-- Every selection must have verified, current odds for the exact market being recommended.
+- Do NOT invent fixtures, odds, injuries, lineups, statistics, bookmaker names, prices, calibration records, CLV, ROI, Kelly stakes or sharp-money evidence.
+- Analyse every discovered fixture independently, in parallel where possible, before ranking candidates.
+- The objective is the best risk-adjusted expected value, not maximum legs or maximum payout.
+- Every selection must have verified, current odds for the exact market.
 - Never substitute odds from another market.
-- Do not confuse probability with value.
-- Do not call a selection a value bet unless the estimated probability exceeds the market-implied probability by a meaningful margin AND the model has sufficient historical evidence for that market.
-- If no genuine edge exists, say so and return NO BET rather than forcing an accumulator.
+- Never claim a market is historically calibrated unless the live calibration engine explicitly reports sufficient samples and edgeValidated=true for that exact market.
+- If the live calibration engine has zero validated markets, return NO QUALIFIED ACCUMULATOR TODAY. Do not estimate around the gate.
+- Never infer a model probability from form, xG, sentiment or bookmaker odds alone and label it calibrated.
+- Never present a Kelly stake for an accumulator as exact unless joint outcome probabilities and payoff states have been explicitly modelled.
 
 ANALYSIS PROCESS
 
 STEP 1 — DISCOVER FIXTURES
-Find today's relevant football fixtures and verify exact teams, competition, kickoff time/date, fixture status, and current odds availability.
+Verify exact teams, competition, kickoff time/date, future status and odds availability. Reject stale, live, finished, postponed, cancelled or unverifiable fixtures.
 
 STEP 2 — ANALYSE EACH MATCH INDEPENDENTLY
-For every candidate match analyse current exact-market bookmaker odds, opening/current line movement, market-implied probability after overround, raw model probability, market-specific calibrated probability, expected value, recent form, home/away performance, xG/xGA, strength of opposition, injuries/suspensions, confirmed/predicted lineups, rotation/fatigue, rest days, tactical matchup, motivation/context, weather/pitch where relevant, referee factors where relevant, statistically useful H2H, market movement/sharp-money indicators, data completeness, and historical model performance for the exact market.
+Analyse current exact-market odds, opening/current movement, de-vigged market probability, deterministic model probability where available, exact market calibration status, EV, recent form, home/away performance, xG/xGA, opposition strength, injuries/suspensions, confirmed/predicted lineups, fatigue/rest, tactical matchup, motivation/context, weather/pitch where relevant, referee factors where relevant, statistically useful H2H, market movement, data completeness and historical performance for the exact market.
 
 STEP 3 — MARKET SELECTION
-Consider 1X2, Double Chance, Draw No Bet, Asian Handicap, Over/Under goals, BTTS and team totals. Choose the market with the best combination of calibrated probability, verified price, expected value, historical market performance, and robustness to lineup/news uncertainty.
+Consider 1X2, Double Chance, DNB, Asian Handicap, Over/Under, BTTS and team totals. Choose only markets with verified prices and live validation evidence.
 
 STEP 4 — EDGE VALIDATION
-For every candidate calculate implied probability = 1 / decimal odds; raw edge = model probability - implied probability; expected value = (model probability × decimal odds) - 1.
-Reject selections with unverified odds, poor data completeness, unavailable calibration, insufficient historical sample, unsupported walk-forward backtest, statistically weak ROI, weak CLV, an edge too small for model uncertainty, or excessive sensitivity to uncertain lineup/injury information.
+For ordinary fixed win/lose markets calculate implied probability = 1 / odds and EV = (p × odds) - 1 using the deterministic calibrated p. For DNB/AH/other push or half-win markets, use the correct payoff distribution; do not apply the ordinary formula blindly. Reject any candidate with missing calibration, insufficient sample, failed walk-forward validation, weak ROI/CLV evidence, poor data completeness, stale odds or uncertainty large enough to erase the edge.
 
-STEP 5 — UNCERTAINTY ADJUSTMENT
-Treat probability as uncertain. Penalize missing data, stale odds, uncertain lineups, major injury uncertainty, small samples, model disagreement and volatile markets. Prefer selections whose edge remains positive after a conservative probability haircut.
+STEP 5 — UNCERTAINTY
+Apply conservative probability haircuts for missing data, lineup uncertainty, model disagreement, volatile prices and small samples. Prefer edges that remain positive after the haircut.
 
-STEP 6 — BUILD THE ACCUMULATOR
-Target ideally 3–6 legs and maximum 8 unless evidence is unusually strong. Never add a leg merely to increase payout. Rank by validated edge, calibrated probability, robustness, CLV evidence, data quality, market reliability and model agreement. Avoid highly correlated selections unless correlation is explicitly modelled. Do not stack multiple selections from the same game unless their joint relationship has been evaluated.
+STEP 6 — ACCUMULATOR
+Target 3–6 legs, max 8 only with unusually strong evidence. Do not add weak legs for payout. Do not multiply leg probabilities unless independence/correlation is explicitly modelled. If independence is not modelled, report combined probability as an approximation and do not call the accumulator probability exact. Never compute an exact accumulator Kelly stake from independent-leg multiplication alone.
 
-STEP 7 — PORTFOLIO OPTIMIZATION
-Produce THREE portfolios:
-A) SAFE ACCUMULATOR — 3–4 legs, highest probability, lowest variance.
-B) BALANCED ACCUMULATOR — 4–6 legs, best risk-adjusted expected value; PRIMARY recommendation.
-C) AGGRESSIVE ACCUMULATOR — 5–8 legs, only selections that still have demonstrable edge; explicitly quantify additional risk.
-Do not create the aggressive accumulator by adding weak selections.
+STEP 7 — PORTFOLIOS
+A) SAFE: 3–4 highest-probability qualified legs.
+B) BALANCED: 4–6 best risk-adjusted qualified legs; PRIMARY.
+C) AGGRESSIVE: 5–8 legs only where each leg independently passes the same evidence gate.
 
 STEP 8 — FINAL VALIDATION
-Independently re-check every leg: fixture, market, selection, current odds, calibrated probability, EV, historical edge, team news, correlation and data quality. Remove any leg that fails.
+Re-check every leg: fixture, market, selection, exact odds, calibration status, sample size, walk-forward evidence, EV, data quality, lineup/news risk and correlation. Remove anything unsupported.
 
 FINAL OUTPUT
-Start with PRIMARY RECOMMENDATION containing accumulator legs, combined odds, estimated hit probability, market-implied probability, estimated EV, risk level and number of legs.
-Then provide a table with: fixture, market, selection, odds, calibrated probability, implied probability, edge, EV, confidence and data quality.
-Then explain why each leg qualifies.
-Then provide SAFE ACCUMULATOR, BALANCED ACCUMULATOR — PRIMARY, AGGRESSIVE ACCUMULATOR, BEST SINGLE BET, DANGEROUS / REJECTED PICKS, and PORTFOLIO WARNING.
+PRIMARY RECOMMENDATION with legs, combined odds, probability estimate labelled exact or approximate, implied probability, EV, risk level and number of legs.
+Then a table with fixture, market, selection, exact odds, calibrated probability, implied probability, edge, EV, calibration samples, data quality and confidence.
+Then SAFE, BALANCED, AGGRESSIVE, BEST SINGLE BET, REJECTED PICKS and PORTFOLIO WARNING.
 
-FINAL RULE: If available fixtures do not contain enough statistically validated value, return exactly: NO QUALIFIED ACCUMULATOR TODAY, and explain why. Never manufacture an accumulator.`
+FINAL RULE: If the live evidence cannot prove a calibrated market edge, return exactly NO QUALIFIED ACCUMULATOR TODAY and explain which gate failed. Never manufacture a bet.`
 } as const;
 
 export type AgentPreset = keyof typeof AGENT_PRESETS;
-
-export function getAgentPreset(name: string): string | null {
-  return name in AGENT_PRESETS ? AGENT_PRESETS[name as AgentPreset] : null;
-}
+export function getAgentPreset(name: string): string | null { return name in AGENT_PRESETS ? AGENT_PRESETS[name as AgentPreset] : null; }
