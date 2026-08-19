@@ -1,11 +1,10 @@
 /**
- * Broad, scraper-independent fixture discovery.
- *
- * This module deliberately does not depend on Soccerway/Flashscore/Puppeteer.
- * Search providers are treated as discovery feeds, while the orchestrator's
- * future-fixture gate remains the authority on whether a match may be analysed.
+ * Broad fixture discovery using every available layer: local browser,
+ * structured fixture APIs, and search providers. The local browser is now a
+ * first-class discovery source rather than only a deep-analysis scraper.
  */
 import { serpSearch, taloredataSearch, allSportsFixtures, type ToolResult } from './tools.js';
+import { localBrowserFixtureDiscovery } from './local-fixture-discovery.js';
 
 const MAX_SEARCH_RESULTS = Number(process.env.MAX_DISCOVERY_FIXTURES || 30);
 
@@ -28,13 +27,18 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
     `football fixtures ${date} site:worldfootball.net OR site:globalsportsarchive.com`,
   ];
 
-  const [api, ...searches] = await Promise.all([
+  // Run local browser discovery in parallel with API/search discovery. A
+  // broken browser source must not collapse the wider discovery pool, while a
+  // browser-only source can still rescue matches missed by APIs/search engines.
+  const [browser, api, ...searches] = await Promise.all([
+    localBrowserFixtureDiscovery(date, sport),
     allSportsFixtures(date, date),
     ...queries.map(q => serpSearch(q)),
     ...queries.slice(0, 3).map(q => taloredataSearch(q)),
   ]);
 
   const parts: string[] = [];
+  if (browser.success && browser.data) parts.push(`=== LOCAL BROWSER FIXTURE DISCOVERY ===\n${browser.data}`);
   if (api.success && api.data) parts.push(`=== STRUCTURED FIXTURE API ===\n${api.data}`);
   searches.forEach((r, i) => {
     if (r.success && r.data) parts.push(`=== DISCOVERY SEARCH ${i + 1} (${r.source || 'search'}) ===\n${r.data}`);
@@ -46,7 +50,7 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
 
   return {
     success: true,
-    data: `[Broad football discovery date=${date}; localDate=${todayInZone(new Date())}; targetPool=${MAX_SEARCH_RESULTS}]\n${parts.join('\n\n').slice(0, 60000)}`,
+    data: `[Broad football discovery date=${date}; localDate=${todayInZone(new Date())}; targetPool=${MAX_SEARCH_RESULTS}; localBrowser=${browser.success ? 'available' : 'failed'}]\n${parts.join('\n\n').slice(0, 80000)}`,
     source: 'broad_fixture_discovery',
   };
 }
