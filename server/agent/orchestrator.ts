@@ -8,6 +8,7 @@ import { runQuantSynthesis } from './subagents/quant-synthesis.js';
 import { mistralPool } from './mistral-pool.js';
 import type { SubAgentResult } from './subagents/base.js';
 import { logPrediction } from './airtable-logger.js';
+import { broadFixtureDiscovery } from './broad-fixture-sources.js';
 
 type AgentName = 'OddsScout' | 'FormScout' | 'InjuryIntel' | 'SentimentAgent' | 'LineupScout';
 interface AgentTask { name: AgentName; focus: string; required: boolean; tier: 1 | 2 | 3; }
@@ -134,26 +135,35 @@ async function repairFixturePayload(raw: string, matchDate: string): Promise<Dis
 }
 
 async function discoverFixtures(userQuery: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
-  const { fetchMatchesToday, allSportsFixtures } = await import('./tools.js');
   onStep({ type: 'status', content: `🔍 WIDE fixture discovery: scanning ${sport} across the full ${matchDate} schedule in ${MARKET_TIMEZONE}…`, timestamp: new Date().toISOString() });
+
+  // Scraper-independent discovery is the primary broad feed. This means a
+  // broken Soccerway/Flashscore/Puppeteer service cannot collapse discovery.
+  const broad = await broadFixtureDiscovery(matchDate, sport);
+  const { fetchMatchesToday, allSportsFixtures } = await import('./tools.js');
+
   const [webResult, apiResult] = await Promise.allSettled([
     fetchMatchesToday(sport, matchDate),
     sport.toLowerCase() === 'football' ? allSportsFixtures(matchDate, matchDate) : Promise.resolve({ success: false, data: '', error: 'structured fixture API is football-only' }),
   ]);
   const web = webResult.status === 'fulfilled' ? webResult.value : { success: false, data: '', error: String(webResult.reason) };
   const api = apiResult.status === 'fulfilled' ? apiResult.value : { success: false, data: '', error: String(apiResult.reason) };
+
   const sources: string[] = [];
+  if (broad.success && broad.data) sources.push(`=== SCRAPER-INDEPENDENT BROAD DISCOVERY ===\n${broad.data}`);
   if (web.success && web.data) sources.push(`=== MULTI-SOURCE WEB/SCRAPER SCHEDULE ===\n${web.data}`);
   if (api.success && api.data) sources.push(`=== STRUCTURED ALLSPORTS FULL-DATE FIXTURE FEED ===\n${api.data}`);
   const combinedSchedule = sources.join('\n\n');
   if (!combinedSchedule) return { fixtures: [], rawSchedule: '' };
-  onStep({ type: 'thought', content: `📚 Broad discovery collected ${sources.length} schedule sources. Shortlisting up to ${MAX_DISCOVERY_FIXTURES} future fixtures instead of only 6–10.`, timestamp: new Date().toISOString() });
+
+  onStep({ type: 'thought', content: `📚 Broad discovery collected ${sources.length} independent schedule feeds. Scraper failure is non-fatal; shortlisting up to ${MAX_DISCOVERY_FIXTURES} future fixtures instead of only 6–10.`, timestamp: new Date().toISOString() });
+
   let llmFixtures: DiscoveredFixture[] = [];
   try {
     const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
-      { role: 'system', content: 'You are a strict football fixture discovery and temporal-validation engine. Build a BROAD candidate pool from the supplied schedules. Extract only REAL scheduled fixtures that have NOT started. Do not limit the pool to famous leagues or the first few results. Deduplicate fixtures. Never invent fixtures, kickoff times, leagues or statuses. Return JSON only.' },
-      { role: 'user', content: `User query: ${userQuery}\nRequested market-local date: ${matchDate}\nMarket timezone: ${MARKET_TIMEZONE}\nCurrent UTC time: ${new Date().toISOString()}\nCandidate schedules:\n${combinedSchedule.substring(0, 30000)}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct relevant FUTURE football fixtures from the ENTIRE supplied schedule, across major and minor leagues/competitions. Do not return only 6-10. Each item must be {"fixture":"Home vs Away","kickoff":"ISO-8601 timestamp with timezone/UTC","status":"scheduled","competition":"..."}. The kickoff MUST be later than current time and must fall on ${matchDate} in ${MARKET_TIMEZONE}. Omit any match already started, live, finished, postponed, cancelled, abandoned, or whose kickoff cannot be verified. Prefer broad league coverage and do not rank popularity above availability of real fixtures.` }
-    ] as any, temperature: 0, maxTokens: Math.min(3500, 150 + MAX_DISCOVERY_FIXTURES * 110) }));
+      { role: 'system', content: 'You are a strict football fixture discovery and temporal-validation engine. Build a BROAD candidate pool from ALL supplied schedules. Extract only REAL scheduled fixtures that have NOT started. Do not limit the pool to famous leagues or the first few results. Deduplicate fixtures. Never invent fixtures, kickoff times, leagues or statuses. Return JSON only.' },
+      { role: 'user', content: `User query: ${userQuery}\nRequested market-local date: ${matchDate}\nMarket timezone: ${MARKET_TIMEZONE}\nCurrent UTC time: ${new Date().toISOString()}\nCandidate schedules:\n${combinedSchedule.substring(0, 50000)}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct relevant FUTURE football fixtures from the ENTIRE supplied schedule, across major and minor leagues/competitions. Do not return only 6-10. Each item must be {"fixture":"Home vs Away","kickoff":"ISO-8601 timestamp with timezone/UTC","status":"scheduled","competition":"..."}. The kickoff MUST be later than current time and must fall on ${matchDate} in ${MARKET_TIMEZONE}. Omit any match already started, live, finished, postponed, cancelled, abandoned, or whose kickoff cannot be verified. Prefer broad league coverage and do not rank popularity above availability of real fixtures.` }
+    ] as any, temperature: 0, maxTokens: Math.min(5000, 150 + MAX_DISCOVERY_FIXTURES * 140) }));
     const raw = String(x.choices?.[0]?.message?.content || '');
     llmFixtures = parseFixturePayload(raw);
     if (!llmFixtures.length) {
