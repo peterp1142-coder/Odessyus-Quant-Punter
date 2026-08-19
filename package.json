@@ -1,19 +1,19 @@
 {
   "name": "odessyus-agent",
-  "version": "2.0.7",
+  "version": "2.0.8",
   "description": "Odessyus - Autonomous ReAct-Driven Sports Forecasting & Betting Agent",
   "type": "module",
   "scripts": {
     "dev": "npx concurrently \"npm run server\" \"npm run client\"",
-    "server": "PUPPETEER_EXECUTABLE_PATH=\"$(node -e \"try{console.log(require('./browser/node_modules/puppeteer').executablePath())}catch(e){process.exit(1)}\")\" PUPPETEER_TOKEN= SCRAPER_TOKEN= tsx watch server/index.ts",
+    "server": "PUPPETEER_CACHE_DIR=/opt/render/project/.chrome PUPPETEER_EXECUTABLE_PATH=\"$(PUPPETEER_CACHE_DIR=/opt/render/project/.chrome node -e \"console.log(require('./browser/node_modules/puppeteer').executablePath())\")\" PUPPETEER_TOKEN= SCRAPER_TOKEN= tsx watch server/index.ts",
     "client": "vite --port 5000 --host 0.0.0.0",
     "build": "npm run build:all",
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
-    "build:browser": "cd browser && npm install --no-audit --no-fund && npx puppeteer browsers install chrome",
+    "build:browser": "cd browser && npm install --no-audit --no-fund && PUPPETEER_CACHE_DIR=/opt/render/project/.chrome npx puppeteer browsers install chrome",
     "build:all": "npm run build:browser && npm run build:client && npm run build:server",
     "preview": "vite preview",
-    "start": "npm run build:server && export PUPPETEER_EXECUTABLE_PATH=\"$(node -e \"console.log(require('./browser/node_modules/puppeteer').executablePath())\")\" && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node dist-server/index.js"
+    "start": "npm run build:server && export PUPPETEER_CACHE_DIR=/opt/render/project/.chrome && export PUPPETEER_EXECUTABLE_PATH=\"$(PUPPETEER_CACHE_DIR=/opt/render/project/.chrome node -e \"console.log(require('./browser/node_modules/puppeteer').executablePath())\")\" && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node dist-server/index.js"
   },
   "dependencies": {
     "@mistralai/mistralai": "^1.3.6",
