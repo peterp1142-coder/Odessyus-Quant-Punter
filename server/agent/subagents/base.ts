@@ -1,12 +1,11 @@
 /**
  * runSubAgent — the core ReAct loop for all specialist subagents.
  *
- * v2 Upgrades:
- *  - Upgraded model: mistral-large-latest (highest accuracy)
- *  - maxIterations increased to 8 (more data gathering per agent)
- *  - Smarter duplicate detection (hash-based URL/query deduplication)
- *  - Better change-approach injection with tool-specific hints
- *  - Observation truncation increased to 6000 chars for richer data
+ * Safety/quality guarantees:
+ *  - Fixture-scoped context isolation for multi-match runs.
+ *  - Strict rejection of placeholder / synthetic URLs and tool names.
+ *  - No invented values, averages or "fallback facts" when evidence is absent.
+ *  - Explicitly marks unavailable fields instead of manufacturing them.
  */
 
 import { dispatchTool } from '../tools.js';
@@ -38,6 +37,15 @@ const CHANGE_APPROACH_HINTS: Record<string, string> = {
   allsports_livescore: 'Try scrape_flashscore or fetch_matches_today for live match data.',
 };
 
+const INVALID_TOOL_NAME_PATTERNS = [
+  /excluded\s+from\s+analysis/i,
+  /waiting/i,
+  /proceeding/i,
+  /final\s+json/i,
+  /^fallback$/i,
+  /action\s+input/i,
+];
+
 function buildChangeApproachMessage(
   consecutiveErrors: number,
   failedTools: string[],
@@ -51,7 +59,73 @@ function buildChangeApproachMessage(
 FAILED SOURCES — do NOT retry any of these: ${triedSources.slice(-8).join(' | ')}
 ${toolHints}
 You have ${remainingIter} iteration(s) remaining. Each must use a NEW source or query.
-If you genuinely cannot gather data, output SUBAGENT_DONE now with whatever you have and mark fields as "unavailable".`;
+If you genuinely cannot gather data, output SUBAGENT_DONE now. DO NOT invent or estimate missing factual fields.`;
+}
+
+function extractTargetFixture(task: string): string | null {
+  const patterns = [
+    /(?:for|about)\s*:\s*([^\n]+?)(?:\s*\([^\n]+\))?(?:\n|$)/i,
+    /fixture\s*=\s*([^\n]+)/i,
+    /\[([^\]]+\s+vs\.?\s+[^\]]+)\]/i,
+  ];
+  for (const pattern of patterns) {
+    const m = task.match(pattern);
+    const value = m?.[1]?.trim();
+    if (value && /\s+(?:vs\.?|v\.?)\s+/i.test(value)) return value;
+  }
+  return null;
+}
+
+function normalizeFixture(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?)\s*/g, ' vs ').trim();
+}
+
+/**
+ * Multi-fixture orchestrator output is wrapped as:
+ *   === Team A vs Team B ===\n...
+ *   === Team C vs Team D ===\n...
+ * Remove other fixture blocks before the specialist sees prior context.
+ */
+function isolateFixtureContext(task: string, targetFixture: string | null): string {
+  if (!targetFixture) return task;
+  const normalizedTarget = normalizeFixture(targetFixture);
+  const marker = /===\s*([^=\n]+?\s+vs\.?\s+[^=\n]+?)\s*===/gi;
+  const matches = [...task.matchAll(marker)];
+  if (!matches.length) return task;
+
+  const sections: string[] = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index ?? 0;
+    const end = i + 1 < matches.length ? (matches[i + 1].index ?? task.length) : task.length;
+    const fixture = normalizeFixture(matches[i][1]);
+    if (fixture === normalizedTarget) sections.push(task.slice(start, end));
+  }
+
+  if (!sections.length) {
+    // Keep the task's own instruction, discard unrelated multi-fixture result blocks.
+    const firstMarker = matches[0].index ?? task.length;
+    return `${task.slice(0, firstMarker).trim()}\n\n=== FIXTURE-ISOLATED PRIOR CONTEXT ===\nNo prior result block was retained because it did not match the requested fixture.`;
+  }
+
+  const instructionEnd = matches[0].index ?? 0;
+  return `${task.slice(0, instructionEnd).trim()}\n\n=== FIXTURE-ISOLATED PRIOR CONTEXT ===\n${sections.join('\n')}`;
+}
+
+function containsPlaceholderUrl(input: Record<string, unknown>): boolean {
+  const values = [input.url, input.query].filter(Boolean).map(String);
+  return values.some(v => /123456|placeholder|example\.com|<[^>]+>|\.{3,}|\/goto\?url=/i.test(v));
+}
+
+function qualityGuardInstruction(agentName: string, fixture: string | null): string {
+  const fixtureText = fixture ? ` The ONLY fixture you are allowed to research is: ${fixture}.` : '';
+  return `QUALITY GATE FOR ${agentName.toUpperCase()}:${fixtureText}
+- Never transfer facts, teams, players, sources, injuries, weather, odds or referee data from another fixture.
+- Never invent a value because a source is missing. Use null/unavailable and explain why.
+- Never use generic league/UEFA averages as if they were the assigned referee's actual statistics.
+- Never use placeholder URLs, IDs, synthetic paths, or guessed entity identifiers.
+- Never output a draft as final evidence when it contains placeholder values.
+- If a tool cannot verify a fact, stop trying to manufacture it and mark it unavailable.
+- A valid JSON object is not evidence by itself; every factual field must be traceable to a tool observation or clearly marked unavailable.`;
 }
 
 export async function runSubAgent(opts: {
@@ -73,10 +147,14 @@ export async function runSubAgent(opts: {
     onStep,
   } = opts;
 
+  const targetFixture = extractTargetFixture(task);
+  const isolatedTask = isolateFixtureContext(task, targetFixture);
+  const guardedSystemPrompt = `${systemPrompt}\n\n${qualityGuardInstruction(agentName, targetFixture)}`;
+
   const steps: ReActStep[] = [];
   const toolErrors: string[] = [];
   const now = () => new Date().toISOString();
-  const triedHashes = new Set<string>(); // prevent exact duplicate calls
+  const triedHashes = new Set<string>();
 
   const emit = (step: ReActStep): ReActStep => {
     const s = { ...step, content: prefix ? `[${prefix}] ${step.content}` : step.content, timestamp: now() };
@@ -85,7 +163,6 @@ export async function runSubAgent(opts: {
     return s;
   };
 
-  // ── Checkpoint: try to resume ────────────────────────────────────────────
   const existing = await loadCheckpoint(sessionId, agentName);
   let messages: Msg[];
   let startIteration: number;
@@ -101,15 +178,14 @@ export async function runSubAgent(opts: {
     accumulatedData = existing.accumulatedData || {};
   } else {
     messages = [
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: task },
+      { role: 'system', content: guardedSystemPrompt },
+      { role: 'user',   content: isolatedTask },
     ];
     startIteration = 0;
     rawOutput = '';
     accumulatedData = {};
   }
 
-  // ── Error tracking ────────────────────────────────────────────────────────
   let consecutiveErrors = 0;
   const triedSources: string[] = [];
   const failedToolNames: string[] = [];
@@ -129,7 +205,6 @@ export async function runSubAgent(opts: {
       if (typeof content !== 'string' || !content.trim()) break;
       rawOutput = content;
 
-      // ── Check for SUBAGENT_DONE ──────────────────────────────────────────
       if (content.includes('SUBAGENT_DONE:')) {
         const idx = content.indexOf('SUBAGENT_DONE:');
         rawOutput = content.substring(idx + 14).trim();
@@ -137,14 +212,11 @@ export async function runSubAgent(opts: {
         break;
       }
 
-      // ── Parse Thought / Action / Action Input ────────────────────────────
       const thoughtM = content.match(/Thought:\s*([\s\S]*?)(?=Action:|SUBAGENT_DONE:|$)/i);
       const actionM  = content.match(/Action:\s*([^\n]+)/i);
       const inputM   = content.match(/Action Input:\s*([\s\S]*?)(?=Thought:|Action:|SUBAGENT_DONE:|$)/i);
 
       const thought  = thoughtM?.[1]?.trim() || '';
-      // Strip markdown bold (**tool**), backticks, and stray asterisks that the
-      // LLM sometimes wraps around tool names, e.g. "Action: **scrape**".
       const toolName = (actionM?.[1]?.trim() || '').replace(/^[*`]+|[*`]+$/g, '').trim();
       const rawInput = inputM?.[1]?.trim() || '{}';
 
@@ -156,7 +228,15 @@ export async function runSubAgent(opts: {
         break;
       }
 
-      // ── Parse tool input ─────────────────────────────────────────────────
+      if (INVALID_TOOL_NAME_PATTERNS.some(pattern => pattern.test(toolName))) {
+        consecutiveErrors++;
+        toolErrors.push(`${toolName}: invalid/non-tool action text`);
+        emit({ type: 'error', content: `Ignored invalid tool action text: ${toolName}`, iteration: i + 1 });
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: `"${toolName}" is not a tool. Stop acting and output SUBAGENT_DONE with verified data only. Do not invent fallback values.` });
+        break;
+      }
+
       let toolInput: Record<string, unknown> = {};
       try {
         const clean = rawInput.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
@@ -168,10 +248,19 @@ export async function runSubAgent(opts: {
         if (urlM) toolInput.url      = urlM[1];
         if (qM)   toolInput.query    = qM[1];
         if (selM) toolInput.selector = selM[1];
-        if (!Object.keys(toolInput).length) toolInput.query = rawInput.replace(/[{}"]/g, '').trim();
+        if (!Object.keys(toolInput).length) toolInput.query = rawInput.replace(/[{}\"]/g, '').trim();
       }
 
-      // Deduplication check
+      if (containsPlaceholderUrl(toolInput)) {
+        consecutiveErrors++;
+        const sourceKey = String(toolInput.url || toolInput.query || '').substring(0, 150);
+        toolErrors.push(`${toolName}: placeholder/synthetic source rejected`);
+        emit({ type: 'error', content: `Rejected placeholder/synthetic source: ${sourceKey}`, iteration: i + 1 });
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: 'That source contains a placeholder/synthetic URL or unresolved entity ID. Do not retry it. Use a real URL discovered from a tool result or output the field as unavailable.' });
+        continue;
+      }
+
       const sourceKey = String(toolInput.url || toolInput.query || '').substring(0, 150);
       const callHash  = `${toolName}:${sourceKey}`;
       if (triedHashes.has(callHash)) {
@@ -184,12 +273,9 @@ export async function runSubAgent(opts: {
       if (sourceKey) triedSources.push(sourceKey);
 
       emit({ type: 'action', content: `→ ${toolName}`, toolName, toolInput, iteration: i + 1 });
-
-      // ── Dispatch tool ─────────────────────────────────────────────────────
       const result = await dispatchTool(toolName, toolInput);
 
       let obs: string;
-
       if (result.success && !result.blocked) {
         obs = (result.data || 'Empty result').substring(0, 6000);
         consecutiveErrors = 0;
@@ -198,12 +284,8 @@ export async function runSubAgent(opts: {
         consecutiveErrors++;
         failedToolNames.push(toolName);
         toolErrors.push(`${toolName}: ${result.error || 'blocked'}`);
-
-        if (result.blocked) {
-          obs = `BLOCKED (${consecutiveErrors}): Anti-bot wall on "${sourceKey}". Do NOT retry this source.`;
-        } else {
-          obs = `ERROR (${consecutiveErrors}): ${result.error || 'unknown'} — source: "${sourceKey}". Do NOT retry.`;
-        }
+        if (result.blocked) obs = `BLOCKED (${consecutiveErrors}): Anti-bot wall on "${sourceKey}". Do NOT retry this source.`;
+        else obs = `ERROR (${consecutiveErrors}): ${result.error || 'unknown'} — source: "${sourceKey}". Do NOT retry.`;
       }
 
       emit({
@@ -213,20 +295,13 @@ export async function runSubAgent(opts: {
       });
 
       messages.push({ role: 'assistant', content });
-      messages.push({ role: 'user',      content: `Observation: ${obs}` });
+      messages.push({ role: 'user', content: `Observation: ${obs}` });
 
-      // ── Inject CHANGE APPROACH directive after 2+ consecutive errors ─────
       if (consecutiveErrors >= 2) {
         const remaining = maxIterations - i - 1;
-
         if (consecutiveErrors >= 3 || remaining <= 1) {
           emit({ type: 'status', content: `⚠️ ${agentName}: ${consecutiveErrors} failures — forcing wrap-up.` });
-          messages.push({
-            role: 'user',
-            content: `You have ${consecutiveErrors} consecutive errors and only ${remaining} iteration(s) left.
-STOP using tools immediately. Output SUBAGENT_DONE with your best estimates using all data gathered so far.
-Mark unavailable fields as null. Include a "data_unavailable_reason" note in sources_used.`,
-          });
+          messages.push({ role: 'user', content: `You have ${consecutiveErrors} consecutive errors and only ${remaining} iteration(s) left. STOP using tools. Output SUBAGENT_DONE with verified data only; set unavailable fields to null.` });
         } else {
           const hint = buildChangeApproachMessage(consecutiveErrors, failedToolNames, triedSources, remaining);
           emit({ type: 'status', content: `🔄 ${agentName}: strategy change injection (${consecutiveErrors} errors)` });
@@ -234,49 +309,31 @@ Mark unavailable fields as null. Include a "data_unavailable_reason" note in sou
         }
       }
 
-      // ── Checkpoint after every iteration ─────────────────────────────────
       await saveCheckpoint({
         sessionId, agentName, messages,
         iteration: i + 1, steps: [...steps],
         rawOutput, accumulatedData,
-        savedAt: Date.now(), version: 3,
+        savedAt: Date.now(), version: 4,
       });
     }
 
-    // ── Forced synthesis if loop exhausted without SUBAGENT_DONE ───────────
-    // If the last LLM response was another tool call (not a done signal),
-    // make one final call to force the agent to wrap up gracefully.
     const hasDone  = rawOutput.includes('SUBAGENT_DONE:');
     const hasJson  = /\{[\s\S]+\}/.test(rawOutput);
     if (!hasDone && !hasJson && messages.length > 2) {
       try {
         emit({ type: 'status', content: `${agentName}: iteration budget exhausted — forcing wrap-up synthesis.` });
-        messages.push({
-          role: 'user',
-          content: `Iteration budget fully exhausted. You MUST stop using tools immediately.
-Output SUBAGENT_DONE: followed by a JSON object with all data you have gathered so far.
-Set unavailable fields to null. Include a "partial": true flag.`,
-        });
+        messages.push({ role: 'user', content: `Iteration budget fully exhausted. Stop using tools. Output SUBAGENT_DONE followed by JSON only. Set unavailable fields to null. Never invent values or use generic fallbacks.` });
         const wrapResp = await mistralPool.call(client =>
-          client.chat.complete({
-            model: 'mistral-large-latest',
-            messages: messages as any,
-            temperature: 0.0,
-            maxTokens: 1500,
-          })
+          client.chat.complete({ model: 'mistral-large-latest', messages: messages as any, temperature: 0.0, maxTokens: 1500 })
         );
         const wrapContent = wrapResp.choices?.[0]?.message?.content;
         if (typeof wrapContent === 'string' && wrapContent) {
           rawOutput = wrapContent;
-          if (wrapContent.includes('SUBAGENT_DONE:')) {
-            const idx = wrapContent.indexOf('SUBAGENT_DONE:');
-            rawOutput = wrapContent.substring(idx + 14).trim();
-          }
+          if (wrapContent.includes('SUBAGENT_DONE:')) rawOutput = wrapContent.substring(wrapContent.indexOf('SUBAGENT_DONE:') + 14).trim();
         }
-      } catch { /* synthesis failed — fall through with whatever rawOutput we have */ }
+      } catch { /* fall through */ }
     }
 
-    // ── Parse structured output ───────────────────────────────────────────
     let data: Record<string, unknown> = {};
     try {
       const jsonMatch = rawOutput.match(/```json\s*([\s\S]+?)\s*```/) || rawOutput.match(/(\{[\s\S]+\})/);
@@ -298,7 +355,6 @@ Set unavailable fields to null. Include a "partial": true flag.`,
       rawOutput,
       toolErrors: hadErrors ? toolErrors : undefined,
     };
-
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     emit({ type: 'error', content: `${agentName} error: ${msg}` });
