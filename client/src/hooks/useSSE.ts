@@ -12,76 +12,46 @@ export interface SSECallbacks {
 export function useSSE() {
   const esRef = useRef<EventSource | null>(null);
 
-  const stream = useCallback((sessionId: string, message: string, callbacks: SSECallbacks) => {
-    // Close any existing connection
+  const stream = useCallback((sessionId: string, message: string, callbacks: SSECallbacks, preset?: string) => {
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
 
-    const encoded = encodeURIComponent(message);
-    const url = `/api/chat/stream/${sessionId}?message=${encoded}`;
-
+    const query = preset
+      ? `preset=${encodeURIComponent(preset)}`
+      : `message=${encodeURIComponent(message)}`;
+    const url = `/api/chat/stream/${sessionId}?${query}`;
     const es = new EventSource(url);
     esRef.current = es;
 
-    es.addEventListener('connected', () => {
-      callbacks.onConnected?.();
-    });
-
+    es.addEventListener('connected', () => callbacks.onConnected?.());
     es.addEventListener('step', (e: MessageEvent) => {
-      try {
-        const step = JSON.parse(e.data) as ReActStep;
-        callbacks.onStep?.(step);
-      } catch { /* ignore */ }
+      try { callbacks.onStep?.(JSON.parse(e.data) as ReActStep); } catch { /* ignore */ }
     });
-
     es.addEventListener('complete', (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data);
-        callbacks.onComplete?.(data);
-      } catch { /* ignore */ }
-      es.close();
-      esRef.current = null;
+      try { callbacks.onComplete?.(JSON.parse(e.data)); } catch { /* ignore */ }
+      es.close(); esRef.current = null;
     });
-
     es.addEventListener('saved', (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data);
-        callbacks.onSaved?.(data);
-      } catch { /* ignore */ }
+      try { callbacks.onSaved?.(JSON.parse(e.data)); } catch { /* ignore */ }
     });
-
     es.addEventListener('error', (e: MessageEvent) => {
       try {
         const data = JSON.parse((e as MessageEvent).data || '{}');
         callbacks.onError?.(data.message || 'Stream error');
-      } catch {
-        callbacks.onError?.('Connection error');
-      }
-      es.close();
-      esRef.current = null;
+      } catch { callbacks.onError?.('Connection error'); }
+      es.close(); esRef.current = null;
     });
-
-    // onerror fires on proxy drop / network blip — close immediately so
-    // EventSource doesn't auto-reconnect and launch a duplicate agent run.
     es.onerror = () => {
-      es.close();
-      esRef.current = null;
+      es.close(); esRef.current = null;
       callbacks.onError?.('Connection lost. Please try again.');
     };
-
-    return () => {
-      es.close();
-      esRef.current = null;
-    };
+    return () => { es.close(); esRef.current = null; };
   }, []);
 
   const cancel = useCallback(() => {
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
   }, []);
 
   return { stream, cancel };
