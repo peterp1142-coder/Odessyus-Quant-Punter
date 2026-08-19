@@ -2,7 +2,8 @@
 import fs from 'fs/promises'; import path from 'path';
 const CHECKPOINT_DIR='/tmp/odessyus-checkpoints';
 export interface CheckpointMessage{role:'user'|'assistant'|'system';content:string;}
-export interface AgentCheckpoint{sessionId:string;agentName:string;messages:CheckpointMessage[];iteration:number;steps:unknown[];rawOutput:string;accumulatedData:Record<string,unknown>;savedAt:number;version:2|3;}
+// Version 4 is used by the current sub-agent loop. Keep older versions readable for compatibility.
+export interface AgentCheckpoint{sessionId:string;agentName:string;messages:CheckpointMessage[];iteration:number;steps:unknown[];rawOutput:string;accumulatedData:Record<string,unknown>;savedAt:number;version:2|3|4;}
 const filePath=(s:string)=>path.join(CHECKPOINT_DIR,s.replace(/[^a-zA-Z0-9_-]/g,'_'));
 export async function saveCheckpoint(cp:AgentCheckpoint){try{await fs.mkdir(CHECKPOINT_DIR,{recursive:true});await fs.writeFile(filePath(`${cp.sessionId}__${cp.agentName}.json`),JSON.stringify({...cp,savedAt:Date.now()}),'utf8');}catch(err){console.warn('[Checkpoint] Save failed:',err);}}
 export async function loadCheckpoint(_sessionId:string,_agentName:string):Promise<AgentCheckpoint|null>{return null;}
