@@ -17,18 +17,120 @@ interface DiscoveredFixture { fixture: string; kickoff?: string; status?: string
 
 const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
 const MAX_DISCOVERY_FIXTURES = Number(process.env.MAX_DISCOVERY_FIXTURES || 30);
+
 function marketToday(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
+
 function isTodayOrFuture(kickoff: string | undefined, requestedDate: string): boolean {
   if (!kickoff) return false;
   const d = new Date(kickoff);
   if (Number.isNaN(d.getTime())) return false;
   return d.getTime() > Date.now() - 120_000 && d.toLocaleDateString('en-CA', { timeZone: MARKET_TIMEZONE }) === requestedDate;
 }
+
 function isCompletedStatus(status: string | undefined): boolean {
   const s = String(status || '').toLowerCase().trim();
   return !!s && /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s);
+}
+
+function balancedJsonCandidates(raw: string): string[] {
+  const text = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const candidates: string[] = [];
+  const starts = ['{', '['];
+  for (const startChar of starts) {
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (start < 0) {
+        if (ch === startChar) { start = i; depth = 1; }
+        continue;
+      }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === startChar) depth++;
+      else if ((startChar === '{' && ch === '}') || (startChar === '[' && ch === ']')) depth--;
+      if (depth === 0) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return candidates.sort((a, b) => b.length - a.length);
+}
+
+function parseFixturePayload(raw: string): DiscoveredFixture[] {
+  for (const candidate of balancedJsonCandidates(raw)) {
+    try {
+      const value = JSON.parse(candidate) as any;
+      const list = Array.isArray(value) ? value : Array.isArray(value?.fixtures) ? value.fixtures : [];
+      if (list.length) return list as DiscoveredFixture[];
+    } catch { /* try the next balanced candidate */ }
+  }
+  return [];
+}
+
+function normalizeFixtureName(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g, ' vs ').trim();
+}
+
+function validateFixtures(values: DiscoveredFixture[], requestedDate: string): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value || typeof value.fixture !== 'string') continue;
+    if (isCompletedStatus(value.status)) continue;
+    if (!isTodayOrFuture(value.kickoff, requestedDate)) continue;
+    const fixture = value.fixture.trim();
+    if (fixture.length < 6) continue;
+    const key = normalizeFixtureName(fixture);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(fixture);
+    if (result.length >= MAX_DISCOVERY_FIXTURES) break;
+  }
+  return result;
+}
+
+function extractStructuredFallback(schedule: string, requestedDate: string): DiscoveredFixture[] {
+  const results: DiscoveredFixture[] = [];
+  for (const candidate of balancedJsonCandidates(schedule)) {
+    try {
+      const value = JSON.parse(candidate) as any;
+      const walk = (node: any) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+        const home = node.homeTeam?.name || node.home_team?.name || node.home?.name || node.homeTeam || node.home_team || node.home;
+        const away = node.awayTeam?.name || node.away_team?.name || node.away?.name || node.awayTeam || node.away_team || node.away;
+        const kickoff = node.kickoff || node.startTime || node.start_time || node.date || node.utcDate || node.utc_date;
+        const status = node.status?.type?.short || node.status?.short || node.status || node.fixture?.status?.short;
+        if (typeof home === 'string' && typeof away === 'string' && typeof kickoff === 'string') {
+          results.push({ fixture: `${home} vs ${away}`, kickoff, status: typeof status === 'string' ? status : 'scheduled', competition: node.competition?.name || node.league?.name });
+        }
+        for (const child of Object.values(node)) walk(child);
+      };
+      walk(value);
+    } catch { /* non-JSON source text */ }
+  }
+  return results;
+}
+
+async function repairFixturePayload(raw: string, matchDate: string): Promise<DiscoveredFixture[]> {
+  try {
+    const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
+      { role: 'system', content: 'Repair fixture extraction. Return ONLY one valid JSON object, with no markdown or commentary, in the exact shape {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Copy only fixtures explicitly present in the supplied response. Never invent or change kickoff times.' },
+      { role: 'user', content: `Requested date: ${matchDate}\nMalformed discovery response:\n${raw.substring(0, 12000)}` }
+    ] as any, temperature: 0, maxTokens: 2500 }));
+    return parseFixturePayload(String(x.choices?.[0]?.message?.content || ''));
+  } catch { return []; }
 }
 
 async function discoverFixtures(userQuery: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
@@ -46,27 +148,33 @@ async function discoverFixtures(userQuery: string, sport: string, matchDate: str
   const combinedSchedule = sources.join('\n\n');
   if (!combinedSchedule) return { fixtures: [], rawSchedule: '' };
   onStep({ type: 'thought', content: `📚 Broad discovery collected ${sources.length} schedule sources. Shortlisting up to ${MAX_DISCOVERY_FIXTURES} future fixtures instead of only 6–10.`, timestamp: new Date().toISOString() });
+  let llmFixtures: DiscoveredFixture[] = [];
   try {
     const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
       { role: 'system', content: 'You are a strict football fixture discovery and temporal-validation engine. Build a BROAD candidate pool from the supplied schedules. Extract only REAL scheduled fixtures that have NOT started. Do not limit the pool to famous leagues or the first few results. Deduplicate fixtures. Never invent fixtures, kickoff times, leagues or statuses. Return JSON only.' },
       { role: 'user', content: `User query: ${userQuery}\nRequested market-local date: ${matchDate}\nMarket timezone: ${MARKET_TIMEZONE}\nCurrent UTC time: ${new Date().toISOString()}\nCandidate schedules:\n${combinedSchedule.substring(0, 30000)}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct relevant FUTURE football fixtures from the ENTIRE supplied schedule, across major and minor leagues/competitions. Do not return only 6-10. Each item must be {"fixture":"Home vs Away","kickoff":"ISO-8601 timestamp with timezone/UTC","status":"scheduled","competition":"..."}. The kickoff MUST be later than current time and must fall on ${matchDate} in ${MARKET_TIMEZONE}. Omit any match already started, live, finished, postponed, cancelled, abandoned, or whose kickoff cannot be verified. Prefer broad league coverage and do not rank popularity above availability of real fixtures.` }
     ] as any, temperature: 0, maxTokens: Math.min(3500, 150 + MAX_DISCOVERY_FIXTURES * 110) }));
-    const raw = x.choices?.[0]?.message?.content || '';
-    const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
-    if (m) {
-      const p = JSON.parse(m[0]) as { fixtures?: DiscoveredFixture[] };
-      const fixtures = Array.isArray(p.fixtures)
-        ? p.fixtures.filter(v => v && typeof v.fixture === 'string').filter(v => !isCompletedStatus(v.status)).filter(v => isTodayOrFuture(v.kickoff, matchDate)).map(v => v.fixture.trim()).filter(s => s.length > 5).filter((s, i, a) => a.indexOf(s) === i).slice(0, MAX_DISCOVERY_FIXTURES)
-        : [];
-      if (fixtures.length) {
-        onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} verified future fixtures across the full daily slate. Finished/live/stale matches were excluded before specialist analysis.`, timestamp: new Date().toISOString() });
-        return { fixtures, rawSchedule: combinedSchedule };
-      }
-      onStep({ type: 'error', content: `⚠️ No fixtures passed the future-match gate for ${matchDate}. Refusing to analyse stale/expired matches.`, timestamp: new Date().toISOString() });
+    const raw = String(x.choices?.[0]?.message?.content || '');
+    llmFixtures = parseFixturePayload(raw);
+    if (!llmFixtures.length) {
+      onStep({ type: 'thought', content: '🛠️ Discovery model returned malformed/non-parseable JSON; activating structured repair and source-data fallback instead of discarding today’s fixtures.', timestamp: new Date().toISOString() });
+      llmFixtures = await repairFixturePayload(raw, matchDate);
     }
   } catch (e) {
-    onStep({ type: 'error', content: `⚠️ Broad fixture validation failed; stale fixtures will not be analysed. ${e instanceof Error ? e.message : String(e)}`, timestamp: new Date().toISOString() });
+    onStep({ type: 'error', content: `⚠️ Discovery model failed; using source-data fallback. ${e instanceof Error ? e.message : String(e)}`, timestamp: new Date().toISOString() });
   }
+
+  let fixtures = validateFixtures(llmFixtures, matchDate);
+  if (!fixtures.length) {
+    const fallback = extractStructuredFallback(combinedSchedule, matchDate);
+    fixtures = validateFixtures(fallback, matchDate);
+    if (fixtures.length) onStep({ type: 'thought', content: `🔄 Deterministic schedule fallback recovered ${fixtures.length} future fixtures after discovery-model parsing failed.`, timestamp: new Date().toISOString() });
+  }
+  if (fixtures.length) {
+    onStep({ type: 'thought', content: `📊 Discovered ${fixtures.length} verified future fixtures across the full daily slate. Finished/live/stale matches were excluded before specialist analysis.`, timestamp: new Date().toISOString() });
+    return { fixtures, rawSchedule: combinedSchedule };
+  }
+  onStep({ type: 'error', content: `⚠️ No fixtures passed the future-match gate for ${matchDate}. Raw schedule sources were checked, but no candidate had a verifiable future kickoff.`, timestamp: new Date().toISOString() });
   return { fixtures: [], rawSchedule: combinedSchedule };
 }
 
@@ -76,12 +184,13 @@ async function parseQuery(userQuery: string) {
       { role: 'system', content: 'Extract match info. Return JSON only.' },
       { role: 'user', content: `Extract from "${userQuery}". Return {"fixture":"Team A vs Team B or multiple/open","sport":"football","market":"Match Result","matchDate":"today or YYYY-MM-DD"}.` }
     ] as any, temperature: 0, maxTokens: 200 }));
-    const raw = r.choices?.[0]?.message?.content || '';
-    const m = typeof raw === 'string' ? raw.match(/\{[\s\S]+\}/) : null;
-    if (m) {
-      const p = JSON.parse(m[0]) as any;
-      const requested = p.matchDate === 'today' ? marketToday() : (p.matchDate || marketToday());
-      return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: requested };
+    const raw = String(r.choices?.[0]?.message?.content || '');
+    for (const candidate of balancedJsonCandidates(raw)) {
+      try {
+        const p = JSON.parse(candidate) as any;
+        const requested = p.matchDate === 'today' ? marketToday() : (p.matchDate || marketToday());
+        return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: requested };
+      } catch { /* continue */ }
     }
   } catch { /* safe defaults */ }
   return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: marketToday() };
