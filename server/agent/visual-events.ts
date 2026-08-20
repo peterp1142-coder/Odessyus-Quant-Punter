@@ -1,11 +1,17 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
+export type VerificationStatus = 'none' | 'required' | 'resuming';
+
 export interface LiveVisual {
   sessionId: string;
   image: string;
   url?: string;
   hint?: string;
   capturedAt: string;
+  interactive?: boolean;
+  verificationStatus?: VerificationStatus;
+  verificationType?: string;
+  verificationReason?: string;
 }
 
 const TTL_MS = Math.max(30_000, Number(process.env.LIVE_VISUAL_TTL_MS || 10 * 60_000));
@@ -32,6 +38,32 @@ export function getLatestVisual(sessionId: string): LiveVisual | null {
     return null;
   }
   return visual;
+}
+
+export function publishVerification(
+  sessionId: string,
+  data: Pick<LiveVisual, 'url' | 'hint' | 'image' | 'verificationType' | 'verificationReason'>,
+): void {
+  publishVisual({
+    sessionId,
+    image: data.image,
+    url: data.url,
+    hint: data.hint,
+    interactive: true,
+    verificationStatus: 'required',
+    verificationType: data.verificationType,
+    verificationReason: data.verificationReason,
+  });
+}
+
+export function markVerificationResuming(sessionId: string): void {
+  const current = latest.get(sessionId);
+  if (!current) return;
+  latest.set(sessionId, {
+    ...current,
+    verificationStatus: 'resuming',
+    capturedAt: new Date().toISOString(),
+  });
 }
 
 export function clearVisual(sessionId: string): void {
