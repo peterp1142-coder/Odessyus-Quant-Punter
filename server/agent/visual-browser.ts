@@ -3,22 +3,33 @@ import { mistralPool } from './mistral-pool.js';
 import { currentVisualSessionId, publishVisual } from './visual-events.js';
 
 const VISUAL_PAGE_READY_TIMEOUT_MS = Math.max(5_000, Math.min(20_000, Number(process.env.VISUAL_PAGE_READY_TIMEOUT_MS || 12_000)));
+const VISUAL_NETWORK_IDLE_TIMEOUT_MS = Math.max(2_000, Math.min(12_000, Number(process.env.VISUAL_NETWORK_IDLE_TIMEOUT_MS || 6_000)));
 const VISUAL_PAINT_SETTLE_MS = Math.max(250, Math.min(2_000, Number(process.env.VISUAL_PAINT_SETTLE_MS || 700)));
 
 /**
- * Give client-rendered pages a real chance to paint before taking the frame.
- * `domcontentloaded` is not sufficient for ESPN/365Scores/etc.; their useful
- * content arrives asynchronously after the initial document is parsed.
+ * Client-rendered sports sites often report DOMContentLoaded long before the
+ * fixture cards are painted. Wait for document completion, then for meaningful
+ * visible content, and finally give Chromium a paint cycle before capturing.
  */
 async function waitForRenderablePage(page: Page): Promise<void> {
   try {
     await page.waitForFunction(
-      () => document.readyState === 'interactive' || document.readyState === 'complete',
+      () => document.readyState === 'complete',
       { timeout: VISUAL_PAGE_READY_TIMEOUT_MS },
     );
   } catch {
-    // Some heavily scripted pages never report complete; continue to the
-    // content heuristic rather than failing the visual recovery outright.
+    // Some SPA/streaming pages keep loading forever. The content heuristic below
+    // is the more important signal, so continue rather than failing the scrape.
+  }
+
+  try {
+    await page.waitForNetworkIdle({
+      idleTime: 700,
+      timeout: VISUAL_NETWORK_IDLE_TIMEOUT_MS,
+    });
+  } catch {
+    // Live-score pages may keep long-polling connections open. Do not require
+    // network-idle if the page already contains usable rendered content.
   }
 
   try {
@@ -27,10 +38,10 @@ async function waitForRenderablePage(page: Page): Promise<void> {
         const body = document.body;
         if (!body) return false;
         const text = (body.innerText || '').replace(/\s+/g, ' ').trim();
-        const structuralContent = body.querySelector(
-          'main, [role="main"], #content, #main, #root, #app, table, article, section',
-        );
-        return text.length >= 160 || Boolean(structuralContent);
+        const structuralContent = Array.from(
+          body.querySelectorAll('main, [role="main"], #content, #main, #root, #app, table, article, section'),
+        ).some(el => ((el as HTMLElement).innerText || '').trim().length >= 80);
+        return text.length >= 160 || structuralContent;
       },
       { timeout: VISUAL_PAGE_READY_TIMEOUT_MS },
     );
@@ -39,7 +50,6 @@ async function waitForRenderablePage(page: Page): Promise<void> {
     // consent/captcha/anti-bot state from the rendered frame.
   }
 
-  // Allow one browser paint cycle after the DOM/content heuristic succeeds.
   await new Promise(resolve => setTimeout(resolve, VISUAL_PAINT_SETTLE_MS));
 }
 
