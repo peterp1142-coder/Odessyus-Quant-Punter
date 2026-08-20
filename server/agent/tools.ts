@@ -119,9 +119,11 @@ let browserStarting: Promise<Browser> | null = null;
 const selectorCache = new Map<string,string>();
 const MAX_BROWSER_PAGES = Math.max(1, Math.min(2, Number(process.env.BROWSER_MAX_CONCURRENCY || 2)));
 const RSS_GUARD_BYTES = Math.max(256, Number(process.env.BROWSER_RSS_GUARD_MB || 430)) * 1024 * 1024;
+const VISUAL_MISMATCH_TTL_MS = Math.max(15_000, Math.min(120_000, Number(process.env.VISUAL_MISMATCH_TTL_MS || 45_000)));
 let activeBrowserPages = 0;
 const browserQueue: Array<() => void> = [];
 let browserWatchdog: NodeJS.Timeout | null = null;
+const visualMismatchCache = new Map<string, number>();
 
 function rssBytes(){ return process.memoryUsage().rss; }
 function memoryGuard(){
@@ -208,8 +210,16 @@ async function configureBrowserPage(page:Page){
 }
 
 function cacheKey(url:string,selector:string){try{const u=new URL(url);return `${u.hostname}${u.pathname}|${selector}`;}catch{return `${url}|${selector}`;}}
+function visualKey(url:string,selector:string){return `${cacheKey(url,selector)}|visual`;}
+function visualRecoveryAllowed(url:string,selector:string){
+  const key=visualKey(url,selector);
+  const expires=visualMismatchCache.get(key)||0;
+  if(Date.now()<expires)return false;
+  visualMismatchCache.set(key,Date.now()+VISUAL_MISMATCH_TTL_MS);
+  return true;
+}
 async function navigate(page:Page,url:string,waitTime:number){await page.goto(url,{waitUntil:'domcontentloaded',timeout:30_000});if(waitTime>0)await new Promise(r=>setTimeout(r,Math.min(waitTime,10_000)));}
-async function discoverSelectors(page:Page,hint:string):Promise<string[]>{return page.evaluate((h)=>{const els=Array.from(document.querySelectorAll('div,table,ul,ol,section,article,main,tbody,tr'));const out:{s:string;n:number}[]=[];for(const el of els){const text=(el as HTMLElement).innerText||'';if(text.length<100||text.length>30000)continue;let n=0;if(/\b[1-9]\.\d{2}\b/.test(text))n+=3;if(/[A-Z][a-z]+\s+[-–]\s+[A-Z][a-z]+/.test(text))n+=2;if(/\b\d{1,2}:\d{2}\b/.test(text))n+=2;if(/odds|bet|kickoff|vs|match|fixture|score/i.test(text))n++;if(/\b(?:today|tomorrow|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|jun|jul)\b/i.test(text))n++;if(h&&text.toLowerCase().includes(h.toLowerCase()))n+=2;const links=el.querySelectorAll('a').length;if(links>2&&links<120)n+=1;if(n<3)continue;const id=(el as HTMLElement).id,cls=(el as HTMLElement).className;let s=el.tagName.toLowerCase();if(id)s=`#${id}`;else if(typeof cls==='string'&&cls.trim())s=`${s}.${cls.trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_-]/g,'')}`;out.push({s,n});}return [...new Set(out.sort((a,b)=>b.n-a.n).slice(0,15).map(x=>x.s))];},hint);}
+async function discoverSelectors(page:Page,hint:string):Promise<string[]>{return page.evaluate((h)=>{const els=Array.from(document.querySelectorAll('div,table,ul,ol,section,article,main,tbody,tr'));const out:{s:string;n:number}[]=[];for(const el of els){const text=(el as HTMLElement).innerText||'';if(text.length<100||text.length>30000)continue;let n=0;if(/\b[1-9]\.\d{2}\b/.test(text))n+=3;if(/[A-Z][a-z]+\s+[-–]\s+[A-Z][a-z]+/.test(text))n+=2;if(/\b\d{1,2}:\d{2}\b/.test(text))n+=2;if(/odds|bet|kickoff|vs|match|fixture|score/i.test(text))n++;if(/\b(?:today|tomorrow|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|jun|jul)\b/i.test(text))n++;if(h&&text.toLowerCase().includes(h.toLowerCase()))n+=2;const links=el.querySelectorAll('a').length;if(links>2&&links<120)n+=1;const id=(el as HTMLElement).id,cls=(el as HTMLElement).className;let s=el.tagName.toLowerCase();if(id)s=`#${id}`;else if(typeof cls==='string'&&cls.trim())s=`${s}.${cls.trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_-]/g,'')}`;if(n>=3)out.push({s,n});}return [...new Set(out.sort((a,b)=>b.n-a.n).slice(0,15).map(x=>x.s))];},hint);}
 async function extract(page:Page,selector:string){return page.evaluate(sel=>Array.from(document.querySelectorAll(sel)).map(e=>(e as HTMLElement).innerText||'').join('\n').trim(),selector);}
 
 export async function scrape(url:string,selector:string,waitTime=7000):Promise<ToolResult>{
@@ -219,17 +229,57 @@ export async function scrape(url:string,selector:string,waitTime=7000):Promise<T
       await navigate(page,url,waitTime);
       const candidates=[selectorCache.get(key),selector].filter(Boolean) as string[]; let text='';
       for(const s of candidates){try{const t=await extract(page,s);if(t.length>=100){text=t;break;}}catch{}}
+
       let visual='';
+      let selectorMismatch=false;
       if(text.length<100){
+        selectorMismatch=true;
         console.log(`[SCRAPE] Selector mismatch: ${selector} @ ${url}; inspecting live DOM`);
-        for(const s of await discoverSelectors(page,selector)){try{const t=await extract(page,s);if(t.length>=100){text=t;selectorCache.set(key,s);console.log(`[SCRAPE] Recovered selector: ${s}`);break;}}catch{}}
+        const discovered=await discoverSelectors(page,selector);
+        const candidateTexts: Array<{selector:string;text:string}> = [];
+        for(const s of discovered){
+          try{
+            const t=await extract(page,s);
+            if(t.length>=100)candidateTexts.push({selector:s,text:t.slice(0,1800)});
+          }catch{}
+        }
+
+        if(candidateTexts.length && visualRecoveryAllowed(url,selector)){
+          const context=candidateTexts.slice(0,8).map(c=>`SELECTOR: ${c.selector}\nTEXT: ${c.text}`).join('\n---\n');
+          visual=await inspectPageVisually(page,selector,context);
+          const best=visual.match(/^BEST_SELECTOR:\s*(.+)$/im)?.[1]?.trim();
+          if(best && discovered.includes(best)){
+            try{
+              const bestText=await extract(page,best);
+              if(bestText.length>=100){
+                text=bestText;
+                selectorCache.set(key,best);
+                console.log(`[SCRAPE] Visual recovery selected selector: ${best}`);
+              }
+            }catch{}
+          }
+        }
+
+        if(text.length<100 && candidateTexts.length){
+          const chosen=candidateTexts[0];
+          text=chosen.text;
+          selectorCache.set(key,chosen.selector);
+          console.log(`[SCRAPE] Recovered selector: ${chosen.selector}`);
+        }
       }
+
       if(text.length<100){
         text=await page.evaluate(()=>document.body?.innerText||'');
         if(text.length>=100)console.log(`[SCRAPE] Using full-body fallback after selector recovery failed: ${url}`);
       }
+
+      if(selectorMismatch && visual && !/^blocked$/i.test(visual.trim())){
+        const cleanVisual=visual.replace(/^BEST_SELECTOR:\s*.+$/im,'').trim();
+        if(cleanVisual && !text.includes(cleanVisual.slice(0,160))) text=`${text}\n\n[VISUAL PAGE CONTEXT]\n${cleanVisual}`;
+      }
+
       if(text.length<100){
-        visual=await inspectPageVisually(page,selector);
+        if(!visual && visualRecoveryAllowed(url,selector)) visual=await inspectPageVisually(page,selector);
         if(visual && !/^blocked$/i.test(visual.trim())) text=`[VISUAL PAGE RECOVERY]\n${visual}`;
       }
       if(text.length<100)return{success:false,data:'',error:'Scrape yielded insufficient content after local DOM + visual recovery',source:'scrape:local-browser'};
