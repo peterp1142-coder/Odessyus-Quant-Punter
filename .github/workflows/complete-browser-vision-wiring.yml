@@ -17,21 +17,28 @@ jobs:
           ref: main
           fetch-depth: 1
 
-      - name: Patch browser resource policy and fetch path
+      - name: Patch browser resource policy, fetch path, consent handling and visual DOM safety
         shell: python
         run: |
           from pathlib import Path
           import re
 
-          p = Path('server/agent/tools.ts')
-          s = p.read_text()
+          tools = Path('server/agent/tools.ts')
+          s = tools.read_text()
 
+          # Keep CSS for Mistral vision while still blocking heavy resources.
           old_block = "if(['image','stylesheet','font','media','websocket'].includes(type))req.abort(); else req.continue();"
           new_block = "if(['image','font','media','websocket'].includes(type))req.abort(); else req.continue();"
-          if old_block not in s:
-              raise SystemExit('configureBrowserPage resource policy pattern not found')
-          s = s.replace(old_block, new_block, 1)
+          if old_block in s:
+              s = s.replace(old_block, new_block, 1)
 
+          # Increase CDP protocol tolerance and prevent browser calls from hanging forever.
+          old_launch = "const b=await puppeteer.launch({headless:true,executablePath,args:browserArgs(),handleSIGINT:false,handleSIGTERM:false,handleSIGHUP:false});"
+          new_launch = "const b=await puppeteer.launch({headless:true,executablePath,args:browserArgs(),protocolTimeout:60_000,handleSIGINT:false,handleSIGTERM:false,handleSIGHUP:false});"
+          if old_launch in s:
+              s = s.replace(old_launch, new_launch, 1)
+
+          # Replace fetch_url's direct HTTP-first behavior with browser-first retrieval.
           old_fetch = re.compile(r"export async function fetchUrl\(url:string,useMobile=false\):Promise<ToolResult>\{.*?\}\n\nlet browser: Browser \| null = null;", re.S)
           new_fetch = '''export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>{
   try{
@@ -53,18 +60,83 @@ let browser: Browser | null = null;'''
           ns, count = old_fetch.subn(new_fetch, s, count=1)
           if count != 1:
               raise SystemExit('fetchUrl function pattern not found')
-          p.write_text(ns)
+
+          # Add consent handling helper if not already present.
+          if 'async function handleCookieConsent' not in ns:
+              marker = "async function configureBrowserPage(page:Page){"
+              helper = '''async function handleCookieConsent(page:Page){
+  for(let attempt=0;attempt<3;attempt++){
+    const clicked=await page.evaluate(()=>{
+      const nodes=Array.from(document.querySelectorAll('button,[role="button"],input[type="button"],a')) as HTMLElement[];
+      const reject=/^(reject all|reject all cookies|reject|decline|only necessary|necessary only|continue without accepting)$/i;
+      const consentWords=/(cookie|privacy|consent|partners|personal data|tracking)/i;
+      for(const node of nodes){
+        const text=(node.innerText||node.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
+        if(!text || !reject.test(text)) continue;
+        const box=node.getBoundingClientRect();
+        if(box.width<2 || box.height<2) continue;
+        let ancestor:HTMLElement|null=node;
+        for(let i=0;i<5 && ancestor;i++,ancestor=ancestor.parentElement){
+          const t=(ancestor.innerText||'').slice(0,5000);
+          const cls=ancestor.className||'';
+          if(consentWords.test(t)||consentWords.test(String(cls))){ node.click(); return text; }
+        }
+      }
+      return '';
+    }).catch(()=> '');
+    if(clicked){
+      console.log(`[Browser] Cookie/consent gate handled: ${clicked}`);
+      await new Promise(r=>setTimeout(r,600));
+      return;
+    }
+    await new Promise(r=>setTimeout(r,300));
+  }
+}
+
+'''
+              if marker in ns:
+                  ns = ns.replace(marker, helper + marker, 1)
+              else:
+                  raise SystemExit('configureBrowserPage marker not found')
+
+          # Harden page configuration: keep CSS, dismiss JS dialogs, run consent handler.
+          old_cfg = "page.on('request',req=>{ try{ const type=req.resourceType(); if(['image','stylesheet','font','media','websocket'].includes(type))req.abort(); else req.continue(); }catch{} });"
+          new_cfg = "page.on('request',req=>{ try{ const type=req.resourceType(); if(['image','font','media','websocket'].includes(type))req.abort(); else req.continue(); }catch{} });"
+          if old_cfg in ns:
+              ns = ns.replace(old_cfg, new_cfg, 1)
+          if "page.on('dialog',dialog=>dialog.dismiss().catch(()=>{}));" not in ns:
+              ns = ns.replace("await page.setExtraHTTPHeaders({'Accept-Language':'en-US,en;q=0.9',Accept:'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'});", "await page.setExtraHTTPHeaders({'Accept-Language':'en-US,en;q=0.9',Accept:'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'});\n  page.on('dialog',dialog=>dialog.dismiss().catch(()=>{}));", 1)
+          ns = re.sub(r"await page\.setDefaultNavigationTimeout\(30_000\); await page\.setDefaultTimeout\(30_000\);", "await page.setDefaultNavigationTimeout(30_000); await page.setDefaultTimeout(20_000);", ns, count=1)
+          if 'await handleCookieConsent(page);' not in ns:
+              # Insert at end of configureBrowserPage just before its closing brace.
+              cfg = re.search(r"async function configureBrowserPage\(page:Page\)\{(.*?)\n\}", ns, re.S)
+              if not cfg:
+                  raise SystemExit('configureBrowserPage body not found')
+              body = cfg.group(1)
+              if 'await handleCookieConsent(page);' not in body:
+                  body += "\n  await handleCookieConsent(page);"
+                  ns = ns[:cfg.start(1)] + body + ns[cfg.end(1):]
+
+          tools.write_text(ns)
+
+          visual = Path('server/agent/visual-browser.ts')
+          v = visual.read_text()
+          old_candidates = "const elements = Array.from(document.querySelectorAll('main,[role=\"main\"],#content,#main,#root,#app,table,tbody,tr,article,section,nav,button,a,div'));"
+          new_candidates = "const elements = Array.from(document.querySelectorAll('main,[role=\"main\"],#content,#main,#root,#app,table,tbody,tr,article,section,nav,button,a')).slice(0,1800);"
+          if old_candidates in v:
+              v = v.replace(old_candidates, new_candidates, 1)
+          visual.write_text(v)
 
       - name: Verify TypeScript
         run: |
           npm install --no-audit --no-fund
           npm run build:server
 
-      - name: Commit browser-first wiring
+      - name: Commit browser resilience wiring
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server/agent/tools.ts
+          git add server/agent/tools.ts server/agent/visual-browser.ts
           git diff --cached --quiet && exit 0
-          git commit -m "[browser-wiring] Make rendered Chromium primary web retrieval path"
+          git commit -m "[browser-wiring] Harden semantic browser consent, DOM inspection and timeouts"
           git push origin main
