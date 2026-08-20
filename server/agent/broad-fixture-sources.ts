@@ -9,16 +9,14 @@ import { extractFixtureCandidates, serializeFixtureCandidates } from './fixture-
 
 const MAX_SEARCH_RESULTS = Number(process.env.MAX_DISCOVERY_FIXTURES || 30);
 const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
+const SEARCH_BATCH_SIZE = Math.max(1, Math.min(2, Number(process.env.DISCOVERY_SEARCH_CONCURRENCY || 2)));
+const SEARCH_QUERY_LIMIT = Math.max(2, Math.min(7, Number(process.env.DISCOVERY_SEARCH_QUERIES || 5)));
 
 function todayInZone(date: Date, timeZone = MARKET_TIMEZONE): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 }
 
-export async function broadFixtureDiscovery(date: string, sport = 'football'): Promise<ToolResult> {
-  if (sport.toLowerCase() !== 'football') {
-    return { success: false, data: '', error: 'Broad fixture discovery currently supports football only', source: 'broad_fixture_discovery' };
-  }
-
+async function runSearchesInBatches(date: string): Promise<ToolResult[]> {
   const queries = [
     `football fixtures ${date} all leagues today kickoff`,
     `soccer fixtures ${date} today all leagues results schedule`,
@@ -27,19 +25,55 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
     `football fixtures ${date} site:espn.com OR site:bbc.com/sport/football`,
     `football fixtures ${date} site:soccerway.com OR site:footystats.org`,
     `football fixtures ${date} site:worldfootball.net OR site:globalsportsarchive.com`,
+  ].slice(0, SEARCH_QUERY_LIMIT);
+
+  const out: ToolResult[] = [];
+  for (let i = 0; i < queries.length; i += SEARCH_BATCH_SIZE) {
+    const batch = queries.slice(i, i + SEARCH_BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map((q) => serpSearch(q)));
+    results.forEach((r) => { if (r.status === 'fulfilled') out.push(r.value); });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return out;
+}
+
+async function runSecondarySearchesInBatches(date: string): Promise<ToolResult[]> {
+  const queries = [
+    `football fixtures ${date} all leagues today kickoff`,
+    `soccer fixtures ${date} Africa Europe Asia today`,
+    `football matches ${date} South America North America today`,
   ];
+  const out: ToolResult[] = [];
+  for (let i = 0; i < queries.length; i += SEARCH_BATCH_SIZE) {
+    const batch = queries.slice(i, i + SEARCH_BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map((q) => taloredataSearch(q)));
+    results.forEach((r) => { if (r.status === 'fulfilled') out.push(r.value); });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return out;
+}
 
-  // Keep the browser, structured feed and search providers running in parallel.
-  // One failed provider must never collapse the discovery pool.
-  const [browser, api, ...searches] = await Promise.all([
-    localBrowserFixtureDiscovery(date, sport),
-    allSportsFixtures(date, date),
-    ...queries.map(q => serpSearch(q)),
-    ...queries.slice(0, 3).map(q => taloredataSearch(q)),
-  ]);
+export async function broadFixtureDiscovery(date: string, sport = 'football'): Promise<ToolResult> {
+  if (sport.toLowerCase() !== 'football') {
+    return { success: false, data: '', error: 'Broad fixture discovery currently supports football only', source: 'broad_fixture_discovery' };
+  }
 
+  // Do not fire ten browser/search jobs at once. Chromium is shared and capped
+  // at two pages; search providers are also deliberately batched so discovery
+  // cannot amplify repeated agent requests into a burst of identical traffic.
+  const browser = await localBrowserFixtureDiscovery(date, sport);
+  const api = await allSportsFixtures(date, date);
+
+  const searches = await runSearchesInBatches(date);
+  // Secondary search is only used when the first pass produced little/no data.
+  const secondary = searches.filter((r) => r.success && r.data).length < 2
+    ? await runSecondarySearchesInBatches(date)
+    : [];
+
+  const allSearches = [...searches, ...secondary];
   const parts: string[] = [];
   const candidateTexts: string[] = [];
+
   if (browser.success && browser.data) {
     parts.push(`=== LOCAL BROWSER FIXTURE DISCOVERY ===\n${browser.data}`);
     candidateTexts.push(browser.data);
@@ -48,7 +82,7 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
     parts.push(`=== STRUCTURED FIXTURE API ===\n${api.data}`);
     candidateTexts.push(api.data);
   }
-  searches.forEach((r, i) => {
+  allSearches.forEach((r, i) => {
     if (r.success && r.data) {
       parts.push(`=== DISCOVERY SEARCH ${i + 1} (${r.source || 'search'}) ===\n${r.data}`);
       candidateTexts.push(r.data);
@@ -73,7 +107,7 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
   const deterministic = [...deduped.values()].slice(0, Math.max(MAX_SEARCH_RESULTS * 3, 90));
 
   const payload = [
-    `[Broad football discovery date=${date}; localDate=${todayInZone(new Date())}; targetPool=${MAX_SEARCH_RESULTS}; localBrowser=${browser.success ? 'available' : 'failed'}]`,
+    `[Broad football discovery date=${date}; localDate=${todayInZone(new Date())}; targetPool=${MAX_SEARCH_RESULTS}; localBrowser=${browser.success ? 'available' : 'failed'}; searchCalls=${allSearches.length}]`,
     `=== DETERMINISTIC FIXTURE CANDIDATES ===`,
     `These candidates are extracted directly from source text. They are not model-generated. The orchestrator must still apply the future/live/stale gate before analysis.`,
     serializeFixtureCandidates(deterministic),
