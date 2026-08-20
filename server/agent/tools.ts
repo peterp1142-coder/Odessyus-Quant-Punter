@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
+import { inspectPageVisually } from './visual-browser.js';
 
 const DUCKDUCKGO_URL = 'https://html.duckduckgo.com/html/';
 const TALORDATA_SERP = 'https://serpapi.talordata.net/serp/v1/request';
@@ -26,7 +27,13 @@ export const LIVE_MATCH_SOURCES: readonly string[] = [
 ];
 
 const truncate = (text: string, max = MAX_CONTENT) => text.length > max ? text.slice(0, max) + '\n...[truncated]' : text;
-const isBlocked = (text: string) => !text || text.length < 400 || ['cloudflare','security verification','access denied','captcha','verify you are human','ddos protection','just a moment','checking your browser'].some(x => text.toLowerCase().includes(x));
+const isBlocked = (text: string) => {
+  const normalized = text.toLowerCase();
+  if (!text || text.length < 400) return true;
+  const strongSignals = ['access denied', 'verify you are human', 'ddos protection', 'just a moment', 'checking your browser', 'security verification'];
+  const hits = strongSignals.filter(x => normalized.includes(x)).length;
+  return hits >= 1 || (normalized.includes('captcha') && normalized.length < 2500);
+};
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number): Promise<Response> {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeout);
@@ -36,8 +43,7 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeout: numb
 function keyPool(name: string): string[] { return (process.env[name] || '').split(',').map(x => x.trim()).filter(Boolean); }
 let serperIdx = 0, taloreIdx = 0, allSportsIdx = 0;
 
-// Small TTL/in-flight cache prevents repeated identical agent searches from multiplying load.
-const SEARCH_CACHE_TTL = 30_000;
+const SEARCH_CACHE_TTL = 45_000;
 const searchCache = new Map<string, { expires: number; result: ToolResult }>();
 const searchInflight = new Map<string, Promise<ToolResult>>();
 function cachedSearch(key: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -108,11 +114,6 @@ export async function allSportsLivescore(): Promise<ToolResult> {
 
 export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>{try{const r=await fetchWithTimeout(url,{headers:{...BROWSER_HEADERS,'User-Agent':useMobile?MOBILE_UA:DESKTOP_UA}},FETCH_TIMEOUT);if(!r.ok)return{success:false,data:'',error:`HTTP ${r.status}`,source:'fetch_url'};const $=cheerio.load(await r.text());$('script,style,nav,header,footer,.ad,.ads,.cookie-banner,[class*="cookie"],[id*="cookie"]').remove();const text=$('body').text().replace(/\s+/g,' ').trim();return text.length>=100?{success:true,data:truncate(text),source:'fetch_url'}:{success:false,data:'',error:'Page too short or empty',source:'fetch_url'};}catch(e){return{success:false,data:'',error:String(e),source:'fetch_url'}}}
 
-// ---------------------------------------------------------------------------
-// Local browser pool: one shared Chromium process, max 2 pages, queued work.
-// This is deliberately kept in-process so a single Render worker does not fork
-// Chrome for every scrape. Contexts/pages are closed after every operation.
-// ---------------------------------------------------------------------------
 let browser: Browser | null = null;
 let browserStarting: Promise<Browser> | null = null;
 const selectorCache = new Map<string,string>();
@@ -208,7 +209,7 @@ async function configureBrowserPage(page:Page){
 
 function cacheKey(url:string,selector:string){try{const u=new URL(url);return `${u.hostname}${u.pathname}|${selector}`;}catch{return `${url}|${selector}`;}}
 async function navigate(page:Page,url:string,waitTime:number){await page.goto(url,{waitUntil:'domcontentloaded',timeout:30_000});if(waitTime>0)await new Promise(r=>setTimeout(r,Math.min(waitTime,10_000)));}
-async function discoverSelectors(page:Page,hint:string):Promise<string[]>{return page.evaluate((h)=>{const els=Array.from(document.querySelectorAll('div,table,ul,ol,section,article,main,tbody,tr'));const out:{s:string;n:number}[]=[];for(const el of els){const text=(el as HTMLElement).innerText||'';if(text.length<100||text.length>30000)continue;let n=0;if(/\b[1-9]\.\d{2}\b/.test(text))n+=3;if(/[A-Z][a-z]+\s+[-–]\s+[A-Z][a-z]+/.test(text))n+=2;if(/\b\d{1,2}:\d{2}\b/.test(text))n+=2;if(/odds|bet|kickoff|vs|match|fixture|score/i.test(text))n++;if(h&&text.toLowerCase().includes(h.toLowerCase()))n+=2;if(n<3)continue;const id=(el as HTMLElement).id,cls=(el as HTMLElement).className;let s=el.tagName.toLowerCase();if(id)s=`#${id}`;else if(typeof cls==='string'&&cls.trim())s=`${s}.${cls.trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_-]/g,'')}`;out.push({s,n});}return [...new Set(out.sort((a,b)=>b.n-a.n).slice(0,12).map(x=>x.s))];},hint);}
+async function discoverSelectors(page:Page,hint:string):Promise<string[]>{return page.evaluate((h)=>{const els=Array.from(document.querySelectorAll('div,table,ul,ol,section,article,main,tbody,tr'));const out:{s:string;n:number}[]=[];for(const el of els){const text=(el as HTMLElement).innerText||'';if(text.length<100||text.length>30000)continue;let n=0;if(/\b[1-9]\.\d{2}\b/.test(text))n+=3;if(/[A-Z][a-z]+\s+[-–]\s+[A-Z][a-z]+/.test(text))n+=2;if(/\b\d{1,2}:\d{2}\b/.test(text))n+=2;if(/odds|bet|kickoff|vs|match|fixture|score/i.test(text))n++;if(/\b(?:today|tomorrow|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|jun|jul)\b/i.test(text))n++;if(h&&text.toLowerCase().includes(h.toLowerCase()))n+=2;const links=el.querySelectorAll('a').length;if(links>2&&links<120)n+=1;if(n<3)continue;const id=(el as HTMLElement).id,cls=(el as HTMLElement).className;let s=el.tagName.toLowerCase();if(id)s=`#${id}`;else if(typeof cls==='string'&&cls.trim())s=`${s}.${cls.trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_-]/g,'')}`;out.push({s,n});}return [...new Set(out.sort((a,b)=>b.n-a.n).slice(0,15).map(x=>x.s))];},hint);}
 async function extract(page:Page,selector:string){return page.evaluate(sel=>Array.from(document.querySelectorAll(sel)).map(e=>(e as HTMLElement).innerText||'').join('\n').trim(),selector);}
 
 export async function scrape(url:string,selector:string,waitTime=7000):Promise<ToolResult>{
@@ -218,24 +219,29 @@ export async function scrape(url:string,selector:string,waitTime=7000):Promise<T
       await navigate(page,url,waitTime);
       const candidates=[selectorCache.get(key),selector].filter(Boolean) as string[]; let text='';
       for(const s of candidates){try{const t=await extract(page,s);if(t.length>=100){text=t;break;}}catch{}}
+      let visual='';
       if(text.length<100){
         console.log(`[SCRAPE] Selector mismatch: ${selector} @ ${url}; inspecting live DOM`);
         for(const s of await discoverSelectors(page,selector)){try{const t=await extract(page,s);if(t.length>=100){text=t;selectorCache.set(key,s);console.log(`[SCRAPE] Recovered selector: ${s}`);break;}}catch{}}
       }
-      if(text.length<100){text=await page.evaluate(()=>document.body?.innerText||'');if(text.length>=100)console.log(`[SCRAPE] Using full-body fallback after selector recovery failed: ${url}`);}
-      if(text.length<100)return{success:false,data:'',error:'Scrape yielded insufficient content after local selector recovery',source:'scrape:local-browser'};
+      if(text.length<100){
+        text=await page.evaluate(()=>document.body?.innerText||'');
+        if(text.length>=100)console.log(`[SCRAPE] Using full-body fallback after selector recovery failed: ${url}`);
+      }
+      if(text.length<100){
+        visual=await inspectPageVisually(page,selector);
+        if(visual && !/^blocked$/i.test(visual.trim())) text=`[VISUAL PAGE RECOVERY]\n${visual}`;
+      }
+      if(text.length<100)return{success:false,data:'',error:'Scrape yielded insufficient content after local DOM + visual recovery',source:'scrape:local-browser'};
       if(isBlocked(text))return{success:false,data:text,blocked:true,error:'Content blocked',source:'scrape:local-browser'};
-      return{success:true,data:truncate(text,14000),source:'scrape:local-browser'};
+      return{success:true,data:truncate(text,14000),source:visual?'scrape:local-browser+vision':'scrape:local-browser'};
     });
   }catch(e){return{success:false,data:'',error:String(e),source:'scrape:local-browser'};}
 }
 
 export async function scrapeFlashscore(dateStr?:string):Promise<ToolResult>{const today=dateStr||new Date().toISOString().slice(0,10);const r=await scrape('https://www.flashscore.mobi/?d=0&s=1','#main',6000);return r.success?{...r,data:`[Date: ${today}] [Source: flashscore:local-browser]\n${r.data}`,source:'flashscore:local-browser'}:r;}
-
 export async function fetchMatchesToday(sport='football',dateStr?:string):Promise<ToolResult>{const today=dateStr||new Date().toISOString().slice(0,10);const sources=['https://www.livescore.com/en/','https://www.bbc.com/sport/football/scores-fixtures','https://www.azscore.com/football/today.html','https://www.scoreboard.com/en/','https://footystats.org/today/'];const [flash,...rest]=await Promise.allSettled([scrapeFlashscore(dateStr),...sources.map(u=>fetchUrl(u))]);const data:string[]=[];if(flash.status==='fulfilled'&&flash.value.success)data.push(`=== FLASHSCORE ===\n${flash.value.data}`);rest.forEach((r,i)=>{if(r.status==='fulfilled'&&r.value.success&&!r.value.blocked)data.push(`=== ${sources[i]} ===\n${r.value.data.slice(0,4000)}`);});if(data.length)return{success:true,data:`[Date: ${today}] [Sport: ${sport}]\n${data.join('\n\n').slice(0,20000)}`,source:'fetch_matches_today:local-browser'};return taloredataSearch(`football matches fixtures today ${today} kickoff times schedule`);}
-
 export async function multiSourceOdds(fixture:string):Promise<ToolResult>{const q=encodeURIComponent(fixture);const targets=[`https://www.oddsportal.com/search/results/?q=${q}`,`https://www.betexplorer.com/results/?sport=soccer&q=${q}`,'https://www.oddschecker.com/football','https://www.pinnacle.com/en/soccer/matchups'];const results=await Promise.allSettled(targets.map(u=>scrape(u,'body',7000)));const data=results.flatMap((r,i)=>r.status==='fulfilled'&&r.value.success?[`--- ${targets[i]} ---\n${r.value.data.slice(0,3500)}`]:[]);return data.length?{success:true,data:truncate(data.join('\n\n'),16000),source:'multi_source_odds'}:taloredataSearch(`${fixture} odds today site:oddsportal.com OR site:betexplorer.com OR site:pinnacle.com`);}
-
 export async function fetchFbrefStats(team:string,_league?:string):Promise<ToolResult>{const s=await taloredataSearch(`${team} xG stats ${new Date().getFullYear()} site:fbref.com`);const m=s.data.match(/https?:\/\/[^\s]+fbref\.com[^\s]*/);if(m){const r=await scrape(m[0],'#stats_shooting, #stats_standard, body',8000);if(r.success)return{...r,data:`[FBref Stats: ${team}]\n${r.data.slice(0,10000)}`};}return s;}
 export async function fetchUnderstatXg(team:string):Promise<ToolResult>{const r=await fetchUrl(`https://understat.com/team/${team.replace(/\s+/g,'_')}`);return r.success?{...r,data:`[Understat xG: ${team}]\n${r.data.slice(0,8000)}`}:taloredataSearch(`${team} understat xG per game season ${new Date().getFullYear()}`);}
 export async function fetchLineups(fixture:string):Promise<ToolResult>{const today=new Date().toISOString().slice(0,10);const [a,b]=await Promise.allSettled([taloredataSearch(`${fixture} confirmed starting lineup ${today}`),scrape(`https://www.sofascore.com/search/events/${encodeURIComponent(fixture)}`,'body',8000)]);const out:string[]=[];if(a.status==='fulfilled'&&a.value.success)out.push(a.value.data);if(b.status==='fulfilled'&&b.value.success)out.push(b.value.data);return out.length?{success:true,data:out.join('\n---\n'),source:'fetch_lineups'}:taloredataSearch(`${fixture} predicted XI ${today}`);}
@@ -245,7 +251,7 @@ export async function placeBetTool(input:Record<string,unknown>):Promise<ToolRes
 
 const BLOCKED_URLS=new Map<string,number>();
 function isUrlBlocked(url:string){const t=BLOCKED_URLS.get(url)||0;if(Date.now()<t)return true;BLOCKED_URLS.delete(url);return false;}
-function markUrlBlocked(url:string){BLOCKED_URLS.set(url,Date.now()+60000);}
+function markUrlBlocked(url:string){BLOCKED_URLS.set(url,Date.now()+30000);}
 function fallbackQuery(url:string,input:Record<string,unknown>){const base=String(input.fixture||input.query||'');if(url.includes('odds'))return `${base} odds bookmaker comparison today`;if(url.includes('sofascore')||url.includes('transfermarkt'))return `${base} confirmed lineup starting XI today`;if(url.includes('fbref')||url.includes('soccerway'))return `${base} head to head form results`;if(url.includes('understat')||url.includes('footystats'))return `${base} xG stats form this season`;return base||url;}
 
 export async function dispatchTool(toolName:string,input:Record<string,unknown>):Promise<ToolResult>{
