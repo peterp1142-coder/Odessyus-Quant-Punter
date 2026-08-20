@@ -1,6 +1,7 @@
 import type { Page } from 'puppeteer-core';
 import { mistralPool } from './mistral-pool.js';
-import { currentVisualSessionId, publishVisual } from './visual-events.js';
+import { currentVisualSessionId, publishVisual, publishVerification, markVerificationResuming } from './visual-events.js';
+import { holdVerificationSession, waitForVerificationResume, completeVerificationSession } from './browser-verification.js';
 
 const VISUAL_ACTION_MAX_STEPS = Math.max(2, Math.min(6, Number(process.env.VISUAL_ACTION_MAX_STEPS || 5)));
 const VISUAL_ACTION_MAX_WAIT_MS = Math.max(500, Math.min(6000, Number(process.env.VISUAL_ACTION_MAX_WAIT_MS || 5000)));
@@ -122,9 +123,9 @@ async function deleteUploadedFile(fileId:string|undefined):Promise<void>{
 }
 
 /**
- * Intent-driven browser vision loop. CAPTCHA/anti-bot challenges are detected and
- * classified by Mistral, but the browser does not automate their completion or
- * bypass. Instead it returns a human-verification requirement to the agent/UI.
+ * Intent-driven visual browsing. A verification challenge pauses inside the
+ * current browser page/context until the user completes the site's own check
+ * and explicitly resumes the job. No automated CAPTCHA solving is performed.
  */
 export async function inspectPageVisually(page:Page,hint='',candidateContext='',sessionId=currentVisualSessionId()||''):Promise<string>{
   if(process.env.VISUAL_BROWSER_ENABLED==='false')return '';
@@ -171,11 +172,22 @@ export async function inspectPageVisually(page:Page,hint='',candidateContext='',
       if(!decision){console.warn('[VISUAL] Mistral returned no valid browser decision; stopping visual loop safely.');break;}
       console.log(`[VISUAL] Decision action=${decision.action}${decision.waitMs?` wait=${decision.waitMs}ms`:''}${decision.selector?` selector=${decision.selector}`:''}${decision.challengeType?` challenge=${decision.challengeType}`:''}${decision.reason?` reason=${decision.reason}`:''}`);
       if(decision.data)lastUsefulData=decision.data;
-      if(decision.action==='READY')return decision.data||lastUsefulData;
+      if(decision.action==='READY'){
+        if(sessionId) completeVerificationSession(sessionId);
+        return decision.data||lastUsefulData;
+      }
       if(decision.action==='BLOCKED'){
         const challenge=decision.challengeType&&decision.challengeType!=='none'?decision.challengeType:'anti-bot/verification challenge';
         console.warn(`[VISUAL] Human verification required: ${challenge}`);
-        return `[HUMAN_VERIFICATION_REQUIRED]\nChallenge: ${challenge}\nConfidence: ${decision.confidence!=null?decision.confidence.toFixed(2):'unknown'}\nReason: ${decision.reason||'Verification page detected.'}${lastUsefulData?`\n${lastUsefulData}`:''}`;
+        if(!sessionId) return `[HUMAN_VERIFICATION_REQUIRED]\nChallenge: ${challenge}\nConfidence: ${decision.confidence!=null?decision.confidence.toFixed(2):'unknown'}\nReason: ${decision.reason||'Verification page detected.'}`;
+        const context=page.browserContext();
+        holdVerificationSession(sessionId,page,context,()=>{}, {challengeType:challenge,reason:decision.reason||'Verification page detected.'});
+        publishVerification(sessionId,{image:`data:image/jpeg;base64,${screenshot}`,url:page.url(),hint,verificationType:challenge,verificationReason:decision.reason||'HUMAN_VERIFICATION_REQUIRED'});
+        const resumed=await waitForVerificationResume(sessionId);
+        if(!resumed) return `[HUMAN_VERIFICATION_EXPIRED]\nChallenge: ${challenge}`;
+        markVerificationResuming(sessionId);
+        lastUsefulData='';
+        continue;
       }
       if(decision.action==='STOP')break;
       const acted=await executeDecision(page,decision,allowedSelectors);
