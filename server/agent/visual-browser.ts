@@ -1,6 +1,6 @@
 import type { Page } from 'puppeteer-core';
 import { mistralPool } from './mistral-pool.js';
-import { publishVisual } from './visual-events.js';
+import { currentVisualSessionId, publishVisual } from './visual-events.js';
 
 /**
  * Visual recovery reuses the already-open local Chromium page. It is used when
@@ -16,7 +16,7 @@ export async function inspectPageVisually(
   page: Page,
   hint = '',
   candidateContext = '',
-  sessionId = '',
+  sessionId = currentVisualSessionId() || '',
 ): Promise<string> {
   if (process.env.VISUAL_BROWSER_ENABLED === 'false') return '';
 
