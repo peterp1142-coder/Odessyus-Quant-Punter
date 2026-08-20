@@ -41,20 +41,22 @@ export function useSSE() {
     es.addEventListener('error', (e: MessageEvent) => {
       try {
         const data = JSON.parse((e as MessageEvent).data || '{}');
-        callbacks.onError?.(data.message || 'Stream error');
-      } catch { /* ignore browser reconnect noise */ }
+        if (data.message) callbacks.onError?.(data.message);
+      } catch { /* ignore browser/network errors */ }
       es.close(); esRef.current = null;
     });
     es.onerror = () => {
-      es.close(); esRef.current = null;
-      // The background job is still alive. This is an observer/network failure,
-      // so the caller should not mark the analysis itself as cancelled.
-      callbacks.onError?.('Connection lost. The analysis is still running in the background.');
+      // Network loss, navigation and refresh only close this observer. The server
+      // continues the background job and a later mount can reconnect to it.
+      es.close();
+      esRef.current = null;
     };
     return () => { es.close(); esRef.current = null; };
   }, []);
 
   const cancel = useCallback(() => {
+    // This only disconnects the observer. There is deliberately no server-side
+    // cancellation endpoint for an in-flight background task.
     if (esRef.current) { esRef.current.close(); esRef.current = null; }
   }, []);
 
