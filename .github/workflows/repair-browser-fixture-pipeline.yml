@@ -1,0 +1,110 @@
+name: Repair browser-first retrieval
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore: automated browser-fixture repair') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch runtime
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          tools = Path('server/agent/tools.ts')
+          s = tools.read_text()
+
+          old = '''export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>{try{const r=await fetchWithTimeout(url,{headers:{...BROWSER_HEADERS,'User-Agent':useMobile?MOBILE_UA:DESKTOP_UA}},FETCH_TIMEOUT);if(!r.ok)return{success:false,data:'',error:`HTTP ${r.status}`,source:'fetch_url'};const $=cheerio.load(await r.text());$('script,style,nav,header,footer,.ad,.ads,.cookie-banner,[class*="cookie"],[id*="cookie"]').remove();const text=$('body').text().replace(/\\s+/g,' ').trim();return text.length>=100?{success:true,data:truncate(text),source:'fetch_url'}:{success:false,data:'',error:'Page too short or empty',source:'fetch_url'};}catch(e){return{success:false,data:'',error:String(e),source:'fetch_url'}}}'''
+
+          new = '''export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>{
+            // Browser-first: every normal webpage is rendered by the shared local Chromium process.
+            // Raw HTTP remains only as a fallback for plain-text/API endpoints or when Chromium cannot retrieve the page.
+            try{
+              const browserResult=await scrape(url,'body',4500);
+              if(browserResult.success && browserResult.data.trim().length>=100)
+                return{...browserResult,source:'fetch_url:local-browser'};
+            }catch{}
+            try{
+              const r=await fetchWithTimeout(url,{headers:{...BROWSER_HEADERS,'User-Agent':useMobile?MOBILE_UA:DESKTOP_UA}},FETCH_TIMEOUT);
+              if(!r.ok)return{success:false,data:'',error:`HTTP ${r.status}`,source:'fetch_url:http-fallback'};
+              const contentType=r.headers.get('content-type')||'';
+              const body=await r.text();
+              if(contentType.includes('text/html')){
+                const $=cheerio.load(body);$('script,style,nav,header,footer,.ad,.ads,.cookie-banner,[class*="cookie"],[id*="cookie"]').remove();
+                const text=$('body').text().replace(/\\s+/g,' ').trim();
+                return text.length>=100?{success:true,data:truncate(text),source:'fetch_url:http-fallback'}:{success:false,data:'',error:'Page too short or empty',source:'fetch_url:http-fallback'};
+              }
+              const text=body.replace(/\\s+/g,' ').trim();
+              return text.length>=20?{success:true,data:truncate(text),source:'fetch_url:http-fallback'}:{success:false,data:'',error:'Response too short or empty',source:'fetch_url:http-fallback'};
+            }catch(e){return{success:false,data:'',error:String(e),source:'fetch_url:http-fallback'}}
+          }'''
+
+          if old not in s:
+              raise SystemExit('fetchUrl implementation not found; refusing unsafe patch')
+          s = s.replace(old,new,1)
+          tools.write_text(s)
+
+          orch = Path('server/agent/orchestrator.ts')
+          o = orch.read_text()
+
+          old_norm = '''function normalizeFixtureName(value: string) { return value.toLowerCase().replace(/\\s+/g, ' ').replace(/\\s*(?:vs\\.?|v\\.?|[-–—])\\s*/g, ' vs ').trim(); }'''
+          new_norm = '''function normalizeFixtureName(value: string) {
+            const raw=String(value||'').replace(/\\s+/g,' ').trim();
+            const m=raw.match(/^(.+?)\\s+(?:vs\\.?|v\\.?)\\s+(.+?)(?=\\s*[·|]\\s*|\\s+(?:League|La Liga|LALIGA|Premier League|Champions League|Europa League|Conference League|Serie A|Bundesliga|Ligue 1)\\b|\\s+\\d{1,2}:\\d{2}\\b|$)/i);
+            const canonical=m?`${m[1].replace(/[.]+$/,'').trim()} vs ${m[2].replace(/[.]+$/,'').trim()}`:raw.replace(/\\s*(?:vs\\.?|v\\.?|[-–—])\\s*/g,' vs ').trim();
+            return canonical.toLowerCase().replace(/\\s+/g,' ').trim();
+          }
+
+          function canonicalFixture(value:string){
+            const raw=String(value||'').replace(/\\s+/g,' ').trim();
+            const m=raw.match(/^(.+?)\\s+(?:vs\\.?|v\\.?)\\s+(.+?)(?=\\s*[·|]\\s*|\\s+(?:League|La Liga|LALIGA|Premier League|Champions League|Europa League|Conference League|Serie A|Bundesliga|Ligue 1)\\b|\\s+\\d{1,2}:\\d{2}\\b|$)/i);
+            return m?`${m[1].replace(/[.]+$/,'').trim()} vs ${m[2].replace(/[.]+$/,'').trim()}`:raw;
+          }
+
+          function fixtureScheduleContext(schedule:string, fixture:string){
+            const clean=canonicalFixture(fixture);
+            const teams=clean.split(/\\s+vs\\s+/i).map(x=>x.trim()).filter(Boolean);
+            if(teams.length!==2)return '';
+            const lines=schedule.split(/\\r?\\n/).filter(line=>{
+              const l=line.toLowerCase();
+              return teams.every(team=>l.includes(team.toLowerCase()));
+            }).slice(0,12);
+            return lines.length?`=== VERIFIED SCHEDULE FOR ${clean} ===\\n${lines.join('\\n')}\\n=== END FIXTURE SCHEDULE ===`:'';
+          }'''
+
+          if old_norm not in o:
+              raise SystemExit('normalizeFixtureName implementation not found; refusing unsafe patch')
+          o=o.replace(old_norm,new_norm,1)
+
+          o=o.replace("const fixture = value.fixture.trim(); if (fixture.length < 6) continue;", "const fixture = canonicalFixture(value.fixture.trim()); if (fixture.length < 6 || !/\\s+vs\\s+/i.test(fixture)) continue;",1)
+          o=o.replace("const scheduleContext = schedule ? `=== VERIFIED SCHEDULE ${matchDate} ===\\n${schedule.slice(0, 5000)}` : '';", "const scheduleContext = '';",1)
+          o=o.replace("const prior = `${scheduleContext}\\n${priorContext(results)}`.trim();", "const prior = `${fixtureScheduleContext(schedule, fx)}\\n${priorContext(results)}`.trim();",1)
+          o=o.replace("const taskText = `${task.focus}\\n\\n${prior}`;", "const taskText = `STRICT FIXTURE SCOPE: ${canonicalFixture(fixture)} (${sport}, ${matchDate}).\\nDo not research, copy, summarize, or infer facts from any other fixture.\\n${task.focus}\\n\\n${prior}`;",1)
+
+          orch.write_text(o)
+          PY
+
+      - name: Verify TypeScript syntax
+        run: npm install --no-audit --no-fund && npm run build:server
+
+      - name: Commit repaired runtime
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/agent/tools.ts server/agent/orchestrator.ts
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: automated browser-fixture repair"
+          git push origin main
