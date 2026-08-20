@@ -1,99 +1,38 @@
 import type { SubAgentResult } from './subagents/base.js';
 
-export interface FixtureTask {
-  agentName: string;
-  fixture: string;
-  tier: number;
-  run: () => Promise<SubAgentResult>;
-}
+export interface FixtureTask { agentName:string; fixture:string; tier:number; run:()=>Promise<SubAgentResult>; }
+interface QueueItem extends FixtureTask { resolve:(value:SubAgentResult)=>void; reject:(reason:unknown)=>void; queuedAt:number; }
 
-interface QueueItem extends FixtureTask {
-  resolve: (value: SubAgentResult) => void;
-  reject: (reason: unknown) => void;
-  queuedAt: number;
-}
-
-/**
- * Per-specialist FIFO scheduling with bounded concurrency.
- * A busy specialist never receives a second fixture at the same time;
- * incoming fixtures wait in its own queue and are processed in order.
- */
 export class FixtureTaskScheduler {
-  private readonly queues = new Map<string, QueueItem[]>();
-  private readonly active = new Map<string, number>();
-  private readonly concurrency = new Map<string, number>();
-
-  constructor(defaultConcurrency = 1) {
-    this.defaultConcurrency = Math.max(1, defaultConcurrency);
+  private readonly queues=new Map<string,QueueItem[]>();
+  private readonly active=new Map<string,number>();
+  private readonly concurrency=new Map<string,number>();
+  constructor(private readonly defaultConcurrency=1){}
+  setConcurrency(agentName:string,limit:number){this.concurrency.set(agentName,Math.max(1,Math.floor(limit)));this.pump(agentName);}
+  enqueue(task:FixtureTask,onQueued?:(position:number)=>void):Promise<SubAgentResult>{
+    const queue=this.queues.get(task.agentName)??[];
+    const promise=new Promise<SubAgentResult>((resolve,reject)=>queue.push({...task,resolve,reject,queuedAt:Date.now()}));
+    this.queues.set(task.agentName,queue);
+    const position=queue.length;
+    if(position>1)onQueued?.(position-1);
+    this.pump(task.agentName); return promise;
   }
-
-  private readonly defaultConcurrency: number;
-
-  setConcurrency(agentName: string, limit: number): void {
-    this.concurrency.set(agentName, Math.max(1, Math.floor(limit)));
-    this.pump(agentName);
-  }
-
-  enqueue(task: FixtureTask, onQueued?: (position: number) => void): Promise<SubAgentResult> {
-    const queue = this.queues.get(task.agentName) ?? [];
-    const item = new Promise<SubAgentResult>((resolve, reject) => {
-      queue.push({ ...task, resolve, reject, queuedAt: Date.now() });
-    });
-    this.queues.set(task.agentName, queue);
-    const position = queue.length;
-    if (position > 1) onQueued?.(position - 1);
-    this.pump(task.agentName);
-    return item;
-  }
-
-  queueDepth(agentName: string): number {
-    return (this.queues.get(agentName) ?? []).length;
-  }
-
-  activeCount(agentName: string): number {
-    return this.active.get(agentName) ?? 0;
-  }
-
-  snapshot(): Record<string, { queued: number; active: number; concurrency: number }> {
-    const names = new Set([...this.queues.keys(), ...this.concurrency.keys(), ...this.active.keys()]);
-    return Object.fromEntries([...names].map(name => [name, {
-      queued: this.queueDepth(name),
-      active: this.activeCount(name),
-      concurrency: this.concurrency.get(name) ?? this.defaultConcurrency,
-    }]));
-  }
-
-  private pump(agentName: string): void {
-    const queue = this.queues.get(agentName);
-    if (!queue) return;
-    const limit = this.concurrency.get(agentName) ?? this.defaultConcurrency;
-    let active = this.active.get(agentName) ?? 0;
-
-    while (active < limit && queue.length) {
-      const item = queue.shift()!;
-      active++;
-      this.active.set(agentName, active);
-      const waitMs = Date.now() - item.queuedAt;
-      void item.run().then(result => {
-        if (waitMs > 250) {
-          console.log(`[Scheduler] ${agentName} waited ${waitMs}ms before processing ${item.fixture}`);
-        }
-        item.resolve(result);
-      }).catch(item.reject).finally(() => {
-        active = Math.max(0, (this.active.get(agentName) ?? 1) - 1);
-        this.active.set(agentName, active);
-        this.pump(agentName);
-      });
-    }
-  }
+  queueDepth(agentName:string){return(this.queues.get(agentName)??[]).length;}
+  activeCount(agentName:string){return this.active.get(agentName)??0;}
+  snapshot(){const names=new Set([...this.queues.keys(),...this.concurrency.keys(),...this.active.keys()]);return Object.fromEntries([...names].map(name=>[name,{queued:this.queueDepth(name),active:this.activeCount(name),concurrency:this.concurrency.get(name)??this.defaultConcurrency}]));}
+  totalQueued(){let n=0;for(const q of this.queues.values())n+=q.length;return n;}
+  private pump(agentName:string){const queue=this.queues.get(agentName);if(!queue)return;const limit=this.concurrency.get(agentName)??this.defaultConcurrency;let active=this.active.get(agentName)??0;while(active<limit&&queue.length){const item=queue.shift()!;active++;this.active.set(agentName,active);const waitMs=Date.now()-item.queuedAt;void item.run().then(result=>{if(waitMs>250)console.log(`[Scheduler] ${agentName} waited ${waitMs}ms before ${item.fixture}`);item.resolve(result);}).catch(item.reject).finally(()=>{active=Math.max(0,(this.active.get(agentName)??1)-1);this.active.set(agentName,active);this.pump(agentName);});}}
 }
 
-export const fixtureScheduler = new FixtureTaskScheduler(1);
-fixtureScheduler.setConcurrency('OddsScout', Number(process.env.AGENT_ODDS_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('FormScout', Number(process.env.AGENT_FORM_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('InjuryIntel', Number(process.env.AGENT_INJURY_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('SentimentAgent', Number(process.env.AGENT_SENTIMENT_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('LineupScout', Number(process.env.AGENT_LINEUP_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('RefereeScout', Number(process.env.AGENT_REFEREE_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('TacticalScout', Number(process.env.AGENT_TACTICAL_CONCURRENCY || 1));
-fixtureScheduler.setConcurrency('DataQualityScout', Number(process.env.AGENT_DATAQUALITY_CONCURRENCY || 1));
+export const fixtureScheduler=new FixtureTaskScheduler(1);
+fixtureScheduler.setConcurrency('OddsScout',Number(process.env.AGENT_ODDS_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('FormScout',Number(process.env.AGENT_FORM_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('InjuryIntel',Number(process.env.AGENT_INJURY_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('SentimentAgent',Number(process.env.AGENT_SENTIMENT_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('LineupScout',Number(process.env.AGENT_LINEUP_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('RefereeScout',Number(process.env.AGENT_REFEREE_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('TacticalScout',Number(process.env.AGENT_TACTICAL_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('DataQualityScout',Number(process.env.AGENT_DATAQUALITY_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('MarketMicrostructureScout',Number(process.env.AGENT_MICROSTRUCTURE_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('ModelRiskScout',Number(process.env.AGENT_MODELRISK_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('PortfolioRiskScout',Number(process.env.AGENT_PORTFOLIO_CONCURRENCY||1));
