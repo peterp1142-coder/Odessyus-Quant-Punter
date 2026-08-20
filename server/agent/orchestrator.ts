@@ -18,49 +18,260 @@ import { broadFixtureDiscovery } from './broad-fixture-sources.js';
 import { fixtureScheduler } from './fixture-task-scheduler.js';
 import { researchCacheStats } from './research-cache.js';
 
-type AgentName='OddsScout'|'FormScout'|'InjuryIntel'|'SentimentAgent'|'LineupScout'|'RefereeScout'|'TacticalScout'|'DataQualityScout'|'MarketMicrostructureScout'|'ModelRiskScout'|'PortfolioRiskScout';
-interface AgentTask{name:AgentName;focus:string;required:boolean;tier:number;}
-interface AgentPlan{reasoning:string;agents:AgentTask[];}
-export interface OrchestratorResult{finalAnswer:string;steps:ReActStep[];success:boolean;error?:string;metadata:any;}
-interface DiscoveredFixture{fixture:string;kickoff?:string;status?:string;competition?:string;}
-const MARKET_TIMEZONE=process.env.MARKET_TIMEZONE||'Africa/Lagos';
-const MAX_DISCOVERY_FIXTURES=Number(process.env.MAX_DISCOVERY_FIXTURES||30);
-const MAX_FIXTURE_PIPELINES=Number(process.env.MAX_FIXTURE_PIPELINES||3);
-function marketToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:MARKET_TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());}
-function isTodayOrFuture(k?:string,requestedDate=''){if(!k)return false;const d=new Date(k);return !Number.isNaN(d.getTime())&&d.getTime()>Date.now()-120000&&d.toLocaleDateString('en-CA',{timeZone:MARKET_TIMEZONE})===requestedDate;}
-function isCompletedStatus(status?:string){const s=String(status||'').toLowerCase().trim();return!!s&&/finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s);}
-function balancedJsonCandidates(raw:string){const text=raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'').trim(),out:string[]=[];for(const startChar of ['{','[']){let start=-1,depth=0,inString=false,escaped=false;for(let i=0;i<text.length;i++){const ch=text[i];if(start<0){if(ch===startChar){start=i;depth=1;}continue;}if(inString){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch==='"')inString=false;continue;}if(ch==='"'){inString=true;continue;}if(ch===startChar)depth++;else if((startChar==='{'&&ch==='}')||(startChar==='['&&ch===']'))depth--;if(depth===0){out.push(text.slice(start,i+1));start=-1;}}}return out.sort((a,b)=>b.length-a.length);}
-function parseFixturePayload(raw:string):DiscoveredFixture[]{for(const c of balancedJsonCandidates(raw)){try{const v=JSON.parse(c) as any;const list=Array.isArray(v)?v:Array.isArray(v?.fixtures)?v.fixtures:[];if(list.length)return list as DiscoveredFixture[];}catch{}}return[];}
-function normalizeFixtureName(v:string){return v.toLowerCase().replace(/\s+/g,' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g,' vs ').trim();}
-function validateFixtures(values:DiscoveredFixture[],date:string){const seen=new Set<string>(),out:string[]=[];for(const v of values){if(!v||typeof v.fixture!=='string'||isCompletedStatus(v.status)||!isTodayOrFuture(v.kickoff,date))continue;const f=v.fixture.trim();if(f.length<6)continue;const k=normalizeFixtureName(f);if(seen.has(k))continue;seen.add(k);out.push(f);if(out.length>=MAX_DISCOVERY_FIXTURES)break;}return out;}
-function extractStructuredFallback(schedule:string):DiscoveredFixture[]{const out:DiscoveredFixture[]=[];for(const c of balancedJsonCandidates(schedule)){try{const v=JSON.parse(c) as any;const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}const home=node.homeTeam?.name||node.home_team?.name||node.home?.name||node.homeTeam||node.home_team||node.home;const away=node.awayTeam?.name||node.away_team?.name||node.away?.name||node.awayTeam||node.away_team||node.away;const kickoff=node.kickoff||node.startTime||node.start_time||node.date||node.utcDate||node.utc_date;const status=node.status?.type?.short||node.status?.short||node.status||node.fixture?.status?.short;if(typeof home==='string'&&typeof away==='string'&&typeof kickoff==='string')out.push({fixture:`${home} vs ${away}`,kickoff,status:typeof status==='string'?status:'scheduled',competition:node.competition?.name||node.league?.name});Object.values(node).forEach(walk);};walk(v);}catch{}}return out;}
-async function repairFixturePayload(raw:string,date:string){try{const x=await mistralPool.call(c=>c.chat.complete({model:'mistral-small-latest',messages:[{role:'system',content:'Return only valid JSON: {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Copy only explicit fixtures; never invent.'},{role:'user',content:`Requested date ${date}\nMalformed schedule:\n${raw.slice(0,12000)}`}] as any,temperature:0,maxTokens:2500}));return parseFixturePayload(String(x.choices?.[0]?.message?.content||''));}catch{return[];}}
-async function discoverFixtures(userQuery:string,sport:string,date:string,onStep:(s:ReActStep)=>void){onStep({type:'status',content:`🔍 Wide discovery: scanning the full ${sport} slate for ${date} in ${MARKET_TIMEZONE}…`});const broad=await broadFixtureDiscovery(date,sport);const{fetchMatchesToday,allSportsFixtures}=await import('./tools.js');const [webResult,apiResult]=await Promise.allSettled([fetchMatchesToday(sport,date),sport.toLowerCase()==='football'?allSportsFixtures(date,date):Promise.resolve({success:false,data:'',error:'football only'})]);const web=webResult.status==='fulfilled'?webResult.value:{success:false,data:'',error:String(webResult.reason)};const api=apiResult.status==='fulfilled'?apiResult.value:{success:false,data:'',error:String(apiResult.reason)};const sources:string[]=[];if(broad.success&&broad.data)sources.push(`=== BROAD ===\n${broad.data}`);if(web.success&&web.data)sources.push(`=== WEB ===\n${web.data}`);if(api.success&&api.data)sources.push(`=== STRUCTURED ===\n${api.data}`);const combined=sources.join('\n\n');if(!combined)return{fixtures:[],rawSchedule:''};onStep({type:'thought',content:`📚 ${sources.length} independent schedule feeds collected; candidates are validated before specialist work.`});let fixtures:DiscoveredFixture[]=[];try{const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-small-latest',messages:[{role:'system',content:'Extract all real future fixtures from supplied schedules. Do not limit to famous leagues. JSON only.'},{role:'user',content:`User:${userQuery}\nDate:${date}\nTimezone:${MARKET_TIMEZONE}\nNow:${new Date().toISOString()}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct future fixtures from the ENTIRE supplied slate with verified ISO kickoff; omit started/live/finished/postponed/cancelled.`}] as any,temperature:0,maxTokens:Math.min(5000,150+MAX_DISCOVERY_FIXTURES*140)}));const raw=String(r.choices?.[0]?.message?.content||'');fixtures=parseFixturePayload(raw);if(!fixtures.length)fixtures=await repairFixturePayload(raw,date);}catch(e){onStep({type:'error',content:`Discovery model failed; deterministic fallback active: ${e instanceof Error?e.message:String(e)}`});}let valid=validateFixtures(fixtures,date);if(!valid.length)valid=validateFixtures(extractStructuredFallback(combined),date);if(!valid.length)onStep({type:'error',content:`⚠️ No verified future fixtures passed the temporal gate for ${date}.`});else onStep({type:'thought',content:`📊 ${valid.length} future fixtures admitted to the fixture registry.`});return{fixtures:valid,rawSchedule:combined};}
-async function parseQuery(userQuery:string){try{const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-small-latest',messages:[{role:'system',content:'Extract match info. Return JSON only.'},{role:'user',content:`Extract from "${userQuery}". Return {"fixture":"Team A vs Team B or multiple/open","sport":"football","market":"Match Result","matchDate":"today or YYYY-MM-DD"}.`}] as any,temperature:0,maxTokens:200}));for(const c of balancedJsonCandidates(String(r.choices?.[0]?.message?.content||''))){try{const p=JSON.parse(c) as any;return{fixture:p.fixture||userQuery,sport:p.sport||'football',market:p.market||'Match Result',matchDate:p.matchDate==='today'?marketToday():(p.matchDate||marketToday())};}catch{}}}catch{}return{fixture:userQuery,sport:'football',market:'Match Result',matchDate:marketToday()};}
-async function buildPlan(fixture:string):Promise<AgentPlan>{return{reasoning:'Fixture-scoped dependency DAG with FIFO specialist queues, adversarial review and portfolio validation.',agents:[
-{name:'OddsScout',focus:`Verify exact-market odds, opening/current price and price integrity for ${fixture}.`,required:true,tier:1},
-{name:'FormScout',focus:`Verify current-season form, xG, venue performance and useful H2H for ${fixture}.`,required:true,tier:1},
-{name:'InjuryIntel',focus:`Verify current injuries, suspensions and availability for ${fixture}.`,required:true,tier:2},
-{name:'SentimentAgent',focus:`Verify current team news, weather, motivation and context for ${fixture}.`,required:false,tier:2},
-{name:'RefereeScout',focus:`Verify appointed referee and referee-specific evidence for ${fixture}; use null when unverified.`,required:false,tier:2},
-{name:'MarketMicrostructureScout',focus:`Verify cross-bookmaker dispersion, overround, liquidity and CLV/price integrity for ${fixture}.`,required:true,tier:2},
-{name:'LineupScout',focus:`Verify confirmed/predicted lineups and late team news for ${fixture}.`,required:true,tier:3},
-{name:'TacticalScout',focus:`Assess exact tactical matchup, formations, transitions and set pieces for ${fixture}.`,required:false,tier:3},
-{name:'ModelRiskScout',focus:`Adversarially stress-test the developing prediction for ${fixture}.`,required:true,tier:4},
-{name:'DataQualityScout',focus:`Audit freshness, provenance, contradictions, missing critical evidence and market-specific applicability for ${fixture}.`,required:true,tier:4},
-]};}
-async function dispatchOne(task:AgentTask,fixture:string,sport:string,matchDate:string,sessionId:string,prior:string,onStep:(s:ReActStep)=>void):Promise<SubAgentResult>{const taskText=`${task.focus}\n\n${prior}`;switch(task.name){case'OddsScout':return runOddsScout(fixture,sport,sessionId,onStep,taskText);case'FormScout':return runFormScout(fixture,sport,sessionId,onStep,taskText);case'InjuryIntel':return runInjuryIntel(fixture,sport,sessionId,onStep,taskText);case'SentimentAgent':return runSentimentAgent(fixture,sport,matchDate,sessionId,onStep,taskText);case'LineupScout':return runLineupScout(fixture,sport,sessionId,onStep,taskText);case'RefereeScout':return runRefereeScout(fixture,sport,sessionId,onStep,taskText);case'TacticalScout':return runTacticalScout(fixture,sport,sessionId,onStep,taskText);case'DataQualityScout':return runDataQualityScout(fixture,sport,sessionId,onStep,taskText);case'MarketMicrostructureScout':return runMarketMicrostructureScout(fixture,sport,sessionId,onStep,taskText);case'ModelRiskScout':return runModelRiskScout(fixture,sport,sessionId,onStep,taskText);case'PortfolioRiskScout':return runPortfolioRiskScout(fixture,sport,sessionId,onStep,taskText);}}
-async function dispatchAgent(task:AgentTask,fixture:string,sport:string,matchDate:string,sessionId:string,prior:string,onStep:(s:ReActStep)=>void):Promise<SubAgentResult>{return fixtureScheduler.enqueue({agentName:task.name,fixture,tier:task.tier,run:()=>dispatchOne(task,fixture,sport,matchDate,sessionId,onStep,s=>onStep({...s,content:`[${fixture}] ${s.content}`}))},position=>onStep({type:'status',content:`⏳ ${task.name}: ${fixture} queued behind ${position} job(s).`}));}
-function priorContext(acc:Record<string,SubAgentResult>){const entries=Object.entries(acc);return entries.length?`=== PRIOR EVIDENCE ===\n${entries.map(([n,r])=>`[${n}] ${(r.rawOutput||JSON.stringify(r.data)).slice(0,1800)}`).join('\n\n')}\n=== END PRIOR EVIDENCE ===`:'';}
-function concurrencyMap<T>(items:T[],limit:number,worker:(x:T,i:number)=>Promise<void>){return new Promise<void>(resolve=>{let next=0,active=0;const pump=()=>{while(active<limit&&next<items.length){const i=next++,item=items[i];active++;worker(item,i).catch(()=>{}).finally(()=>{active--;if(next>=items.length&&active===0)resolve();else pump();});}if(!items.length)resolve();};pump();});}
+type AgentName = 'OddsScout' | 'FormScout' | 'InjuryIntel' | 'SentimentAgent' | 'LineupScout' | 'RefereeScout' | 'TacticalScout' | 'DataQualityScout' | 'MarketMicrostructureScout' | 'ModelRiskScout' | 'PortfolioRiskScout';
+interface AgentTask { name: AgentName; focus: string; required: boolean; tier: number; }
+interface AgentPlan { reasoning: string; agents: AgentTask[]; }
+export interface OrchestratorResult { finalAnswer: string; steps: ReActStep[]; success: boolean; error?: string; metadata: any; }
+interface DiscoveredFixture { fixture: string; kickoff?: string; status?: string; competition?: string; }
 
-export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(step:ReActStep)=>void):Promise<OrchestratorResult>{
- const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};const pool=mistralPool.status();emit({type:'status',content:`🧠 Odessyus initializing — ${pool.total} model keys, ${pool.available} available.`});
- const parsed=await parseQuery(userQuery);let{fixture,sport,market,matchDate}=parsed;let fixtures:string[]=[];let schedule='';if(!fixture||fixture==='multiple/open'||fixture===userQuery){const d=await discoverFixtures(userQuery,sport,matchDate,emit);fixtures=d.fixtures;schedule=d.rawSchedule;if(fixtures.length)fixture=fixtures.join(' | ');}if(!fixtures.length&&(fixture==='multiple/open'||fixture===userQuery))return{finalAnswer:`NO QUALIFIED FIXTURES: I could not verify any future, not-yet-started fixtures for ${matchDate}.`,steps,success:true,metadata:{fixture,sport,market,matchDate,agentsRun:[]}};
- const plan=await buildPlan(fixture);const registry:Record<string,Record<string,SubAgentResult>>={};const scheduleContext=schedule?`=== VERIFIED SCHEDULE ${matchDate} ===\n${schedule.slice(0,5000)}`:'';
- await concurrencyMap(fixtures.length?fixtures:[fixture],MAX_FIXTURE_PIPELINES,async(fx,index)=>{const results:Record<string,SubAgentResult>={};registry[fx]=results;for(const tier of [1,2,3,4]){const tasks=plan.agents.filter(a=>a.tier===tier);if(!tasks.length)continue;emit({type:'status',content:`🚦 ${fx} · Tier ${tier}: ${tasks.map(t=>t.name).join(' + ')}`});const prior=`${scheduleContext}\n${priorContext(results)}`.trim();const settled=await Promise.allSettled(tasks.map(t=>dispatchAgent(t,fx,sport,matchDate,`${sessionId}-${index}`,prior,emit)));for(let i=0;i<tasks.length;i++){const r=settled[i],t=tasks[i];if(r.status==='fulfilled'){results[t.name]=r.value;emit({type:r.value.success?'thought':'error',content:`${r.value.success?'✅':'⚠️'} ${fx} · ${t.name} ${r.value.success?'complete':'failed'}.`});}else results[t.name]={agentName:t.name,success:false,data:{},steps:[],rawOutput:'',error:String(r.reason)};const requiredFailed=tasks.filter(t=>t.required).some(t=>!results[t.name]?.success);if(requiredFailed)emit({type:'error',content:`⛔ ${fx} · Tier ${tier} has missing required evidence; downstream gates remain fail-closed.`});}}});
- const fixturesForPortfolio=Object.entries(registry).map(([fx,r])=>`=== ${fx} ===\n${priorContext(r)}`).join('\n\n');let portfolio:SubAgentResult={agentName:'PortfolioRiskScout',success:false,data:{},steps:[],rawOutput:'',error:'not run'};if(fixtures.length>1){portfolio=await dispatchAgent({name:'PortfolioRiskScout',focus:'Review the entire candidate slate for correlation and concentration.',required:true,tier:5},fixtures.join(' | '),sport,matchDate,`${sessionId}-portfolio`,fixturesForPortfolio,emit);}
- const aggregate=(name:AgentName):SubAgentResult=>{const raws:string[]=[];const datas:Record<string,unknown>={};let successes=0;for(const fx of Object.keys(registry)){const r=registry[fx]?.[name];if(r){if(r.success)successes++;raws.push(`=== ${fx} ===\n${r.rawOutput||JSON.stringify(r.data)}`);datas[fx]=r.data;}}return{agentName:name,success:successes>0,data:{fixtures:datas},steps:[],rawOutput:raws.join('\n\n'),error:successes?'':`No successful ${name} jobs`};};
- const odds=aggregate('OddsScout'),form=aggregate('FormScout'),injury=aggregate('InjuryIntel'),sentiment=aggregate('SentimentAgent'),lineup=aggregate('LineupScout');const advancedText=[aggregate('RefereeScout').rawOutput,aggregate('TacticalScout').rawOutput,aggregate('MarketMicrostructureScout').rawOutput,aggregate('ModelRiskScout').rawOutput,aggregate('DataQualityScout').rawOutput,portfolio.rawOutput].filter(Boolean).join('\n\n');
- try{const enrichedSentiment={...sentiment,rawOutput:[sentiment.rawOutput,'=== ADVANCED EVIDENCE ===',advancedText].join('\n')};const q=await runQuantSynthesis({userQuery,fixture,sport,market,sessionId,oddsResult:odds,formResult:form,injuryResult:injury,sentimentResult:enrichedSentiment,lineupResult:lineup,advancedText,onStep:emit,isMultiFixture:fixtures.length>1,discoveredFixtures:fixtures});if(!q.success)return{finalAnswer:q.finalAnswer||`⚠️ Synthesis failed: ${q.error||'unknown error'}`,steps,success:false,error:q.error,metadata:{fixture,sport,market,fixtures}};const predictionId=`${sessionId}-${Date.now()}`;logPrediction({predictionId,fixture,sport,market,predictedProb:q.trueProb,impliedProb:q.impliedProb,expectedValue:q.expectedValue,isValueBet:q.isValueBet,starRating:q.starRating});emit({type:'synthesis',content:`🏆 ${fixtures.length>1?`Multi-match synthesis complete for ${fixtures.length} fixtures`:'Synthesis complete'} · FIFO queues drained · advanced risk gates applied.`});const agentsRun=plan.agents.map(a=>a.name);if(portfolio.success)agentsRun.push('PortfolioRiskScout');return{finalAnswer:q.finalAnswer,steps,success:true,metadata:{fixture,sport,market,matchDate,fixtures,predictionId,probability:q.trueProb*100,confidence:q.confidence,starRating:q.starRating,expectedValue:q.expectedValue,recommendedOdds:q.recommendedOdds,dataCompletenessScore:q.dataCompletenessScore,isValueBet:q.isValueBet,recommendedStake:q.recommendedStake,categoryProbabilities:q.categoryProbabilities,agentPlan:plan.agents,agentsRun,queueSnapshot:fixtureScheduler.snapshot(),researchCache:researchCacheStats(),fixtureRegistry:Object.fromEntries(Object.entries(registry).map(([fx,r])=>[fx,Object.fromEntries(Object.entries(r).map(([k,v])=>[k,v.success]))])),portfolioRisk:portfolio.data,poolStatus:mistralPool.status()}}catch(e){const msg=e instanceof Error?e.message:String(e);return{finalAnswer:`⚠️ Synthesis failed: ${msg}`,steps,success:false,error:msg,metadata:{fixture,sport,market,fixtures,queueSnapshot:fixtureScheduler.snapshot()}};}
+const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
+const MAX_DISCOVERY_FIXTURES = Number(process.env.MAX_DISCOVERY_FIXTURES || 30);
+const MAX_FIXTURE_PIPELINES = Number(process.env.MAX_FIXTURE_PIPELINES || 3);
+
+function marketToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); }
+function isTodayOrFuture(k?: string, requestedDate = '') { if (!k) return false; const d = new Date(k); return !Number.isNaN(d.getTime()) && d.getTime() > Date.now() - 120000 && d.toLocaleDateString('en-CA', { timeZone: MARKET_TIMEZONE }) === requestedDate; }
+function isCompletedStatus(status?: string) { const s = String(status || '').toLowerCase().trim(); return !!s && /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s); }
+
+function balancedJsonCandidates(raw: string) {
+  const text = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const out: string[] = [];
+  for (const startChar of ['{', '[']) {
+    let start = -1, depth = 0, inString = false, escaped = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (start < 0) { if (ch === startChar) { start = i; depth = 1; } continue; }
+      if (inString) { if (escaped) escaped = false; else if (ch === '\\') escaped = true; else if (ch === '"') inString = false; continue; }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === startChar) depth++;
+      else if ((startChar === '{' && ch === '}') || (startChar === '[' && ch === ']')) depth--;
+      if (depth === 0) { out.push(text.slice(start, i + 1)); start = -1; }
+    }
+  }
+  return out.sort((a, b) => b.length - a.length);
+}
+
+function parseFixturePayload(raw: string): DiscoveredFixture[] {
+  for (const candidate of balancedJsonCandidates(raw)) {
+    try { const value = JSON.parse(candidate) as any; const list = Array.isArray(value) ? value : Array.isArray(value?.fixtures) ? value.fixtures : []; if (list.length) return list as DiscoveredFixture[]; } catch {}
+  }
+  return [];
+}
+
+function normalizeFixtureName(value: string) { return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g, ' vs ').trim(); }
+
+function validateFixtures(values: DiscoveredFixture[], requestedDate: string) {
+  const seen = new Set<string>(); const result: string[] = [];
+  for (const value of values) {
+    if (!value || typeof value.fixture !== 'string') continue;
+    if (isCompletedStatus(value.status)) continue;
+    if (!isTodayOrFuture(value.kickoff, requestedDate)) continue;
+    const fixture = value.fixture.trim(); if (fixture.length < 6) continue;
+    const key = normalizeFixtureName(fixture); if (seen.has(key)) continue;
+    seen.add(key); result.push(fixture); if (result.length >= MAX_DISCOVERY_FIXTURES) break;
+  }
+  return result;
+}
+
+function extractStructuredFallback(schedule: string): DiscoveredFixture[] {
+  const results: DiscoveredFixture[] = [];
+  for (const candidate of balancedJsonCandidates(schedule)) {
+    try {
+      const value = JSON.parse(candidate) as any;
+      const walk = (node: any) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+        const home = node.homeTeam?.name || node.home_team?.name || node.home?.name || node.homeTeam || node.home_team || node.home;
+        const away = node.awayTeam?.name || node.away_team?.name || node.away?.name || node.awayTeam || node.away_team || node.away;
+        const kickoff = node.kickoff || node.startTime || node.start_time || node.date || node.utcDate || node.utc_date;
+        const status = node.status?.type?.short || node.status?.short || node.status || node.fixture?.status?.short;
+        if (typeof home === 'string' && typeof away === 'string' && typeof kickoff === 'string') results.push({ fixture: `${home} vs ${away}`, kickoff, status: typeof status === 'string' ? status : 'scheduled', competition: node.competition?.name || node.league?.name });
+        for (const child of Object.values(node)) walk(child);
+      };
+      walk(value);
+    } catch {}
+  }
+  return results;
+}
+
+async function repairFixturePayload(raw: string, matchDate: string): Promise<DiscoveredFixture[]> {
+  try {
+    const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
+      { role: 'system', content: 'Return only valid JSON: {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Copy only explicit fixtures; never invent.' },
+      { role: 'user', content: `Requested date ${matchDate}\nMalformed schedule:\n${raw.slice(0, 12000)}` },
+    ] as any, temperature: 0, maxTokens: 2500 }));
+    return parseFixturePayload(String(x.choices?.[0]?.message?.content || ''));
+  } catch { return []; }
+}
+
+async function discoverFixtures(userQuery: string, sport: string, date: string, onStep: (s: ReActStep) => void) {
+  onStep({ type: 'status', content: `🔍 Wide discovery: scanning the full ${sport} slate for ${date} in ${MARKET_TIMEZONE}…` });
+  const broad = await broadFixtureDiscovery(date, sport);
+  const { fetchMatchesToday, allSportsFixtures } = await import('./tools.js');
+  const [webResult, apiResult] = await Promise.allSettled([
+    fetchMatchesToday(sport, date),
+    sport.toLowerCase() === 'football' ? allSportsFixtures(date, date) : Promise.resolve({ success: false, data: '', error: 'football only' }),
+  ]);
+  const web = webResult.status === 'fulfilled' ? webResult.value : { success: false, data: '', error: String(webResult.reason) };
+  const api = apiResult.status === 'fulfilled' ? apiResult.value : { success: false, data: '', error: String(apiResult.reason) };
+  const sources: string[] = [];
+  if (broad.success && broad.data) sources.push(`=== BROAD ===\n${broad.data}`);
+  if (web.success && web.data) sources.push(`=== WEB ===\n${web.data}`);
+  if (api.success && api.data) sources.push(`=== STRUCTURED ===\n${api.data}`);
+  const combined = sources.join('\n\n');
+  if (!combined) return { fixtures: [], rawSchedule: '' };
+  onStep({ type: 'thought', content: `📚 ${sources.length} independent schedule feeds collected; candidates are validated before specialist work.` });
+  let fixtures: DiscoveredFixture[] = [];
+  try {
+    const r = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
+      { role: 'system', content: 'Extract all real future fixtures from supplied schedules. Do not limit to famous leagues. JSON only.' },
+      { role: 'user', content: `User:${userQuery}\nDate:${date}\nTimezone:${MARKET_TIMEZONE}\nNow:${new Date().toISOString()}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct future fixtures from the ENTIRE supplied slate with verified ISO kickoff; omit started/live/finished/postponed/cancelled.` },
+    ] as any, temperature: 0, maxTokens: Math.min(5000, 150 + MAX_DISCOVERY_FIXTURES * 140) }));
+    const raw = String(r.choices?.[0]?.message?.content || ''); fixtures = parseFixturePayload(raw); if (!fixtures.length) fixtures = await repairFixturePayload(raw, date);
+  } catch (e) { onStep({ type: 'error', content: `Discovery model failed; deterministic fallback active: ${e instanceof Error ? e.message : String(e)}` }); }
+  let valid = validateFixtures(fixtures, date); if (!valid.length) valid = validateFixtures(extractStructuredFallback(combined), date);
+  if (!valid.length) onStep({ type: 'error', content: `⚠️ No verified future fixtures passed the temporal gate for ${date}.` }); else onStep({ type: 'thought', content: `📊 ${valid.length} future fixtures admitted to the fixture registry.` });
+  return { fixtures: valid, rawSchedule: combined };
+}
+
+async function parseQuery(userQuery: string) {
+  try {
+    const r = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
+      { role: 'system', content: 'Extract match info. Return JSON only.' },
+      { role: 'user', content: `Extract from "${userQuery}". Return {"fixture":"Team A vs Team B or multiple/open","sport":"football","market":"Match Result","matchDate":"today or YYYY-MM-DD"}.` },
+    ] as any, temperature: 0, maxTokens: 200 }));
+    for (const candidate of balancedJsonCandidates(String(r.choices?.[0]?.message?.content || ''))) {
+      try { const p = JSON.parse(candidate) as any; return { fixture: p.fixture || userQuery, sport: p.sport || 'football', market: p.market || 'Match Result', matchDate: p.matchDate === 'today' ? marketToday() : (p.matchDate || marketToday()) }; } catch {}
+    }
+  } catch {}
+  return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: marketToday() };
+}
+
+async function buildPlan(fixture: string): Promise<AgentPlan> {
+  return { reasoning: 'Fixture-scoped dependency DAG with FIFO specialist queues, adversarial review and portfolio validation.', agents: [
+    { name: 'OddsScout', focus: `Verify exact-market odds, opening/current price and price integrity for ${fixture}.`, required: true, tier: 1 },
+    { name: 'FormScout', focus: `Verify current-season form, xG, venue performance and useful H2H for ${fixture}.`, required: true, tier: 1 },
+    { name: 'InjuryIntel', focus: `Verify current injuries, suspensions and availability for ${fixture}.`, required: true, tier: 2 },
+    { name: 'SentimentAgent', focus: `Verify current team news, weather, motivation and context for ${fixture}.`, required: false, tier: 2 },
+    { name: 'RefereeScout', focus: `Verify appointed referee and referee-specific evidence for ${fixture}; use null when unverified.`, required: false, tier: 2 },
+    { name: 'MarketMicrostructureScout', focus: `Verify cross-bookmaker dispersion, overround, liquidity and CLV/price integrity for ${fixture}.`, required: true, tier: 2 },
+    { name: 'LineupScout', focus: `Verify confirmed/predicted lineups and late team news for ${fixture}.`, required: true, tier: 3 },
+    { name: 'TacticalScout', focus: `Assess exact tactical matchup, formations, transitions and set pieces for ${fixture}.`, required: false, tier: 3 },
+    { name: 'ModelRiskScout', focus: `Adversarially stress-test the developing prediction for ${fixture}.`, required: true, tier: 4 },
+    { name: 'DataQualityScout', focus: `Audit freshness, provenance, contradictions, missing critical evidence and market-specific applicability for ${fixture}.`, required: true, tier: 4 },
+  ] };
+}
+
+async function dispatchOne(task: AgentTask, fixture: string, sport: string, matchDate: string, sessionId: string, prior: string, onStep: (s: ReActStep) => void): Promise<SubAgentResult> {
+  const taskText = `${task.focus}\n\n${prior}`;
+  switch (task.name) {
+    case 'OddsScout': return runOddsScout(fixture, sport, sessionId, onStep, taskText);
+    case 'FormScout': return runFormScout(fixture, sport, sessionId, onStep, taskText);
+    case 'InjuryIntel': return runInjuryIntel(fixture, sport, sessionId, onStep, taskText);
+    case 'SentimentAgent': return runSentimentAgent(fixture, sport, matchDate, sessionId, onStep, taskText);
+    case 'LineupScout': return runLineupScout(fixture, sport, sessionId, onStep, taskText);
+    case 'RefereeScout': return runRefereeScout(fixture, sport, sessionId, onStep, taskText);
+    case 'TacticalScout': return runTacticalScout(fixture, sport, sessionId, onStep, taskText);
+    case 'DataQualityScout': return runDataQualityScout(fixture, sport, sessionId, onStep, taskText);
+    case 'MarketMicrostructureScout': return runMarketMicrostructureScout(fixture, sport, sessionId, onStep, taskText);
+    case 'ModelRiskScout': return runModelRiskScout(fixture, sport, sessionId, onStep, taskText);
+    case 'PortfolioRiskScout': return runPortfolioRiskScout(fixture, sport, sessionId, onStep, taskText);
+    default: throw new Error(`Unsupported agent: ${task.name}`);
+  }
+}
+
+async function dispatchAgent(task: AgentTask, fixture: string, sport: string, matchDate: string, sessionId: string, prior: string, onStep: (s: ReActStep) => void): Promise<SubAgentResult> {
+  return fixtureScheduler.enqueue({ agentName: task.name, fixture, tier: task.tier, run: () => dispatchOne(task, fixture, sport, matchDate, sessionId, prior, s => onStep({ ...s, content: `[${fixture}] ${s.content}` })) }, position => onStep({ type: 'status', content: `⏳ ${task.name}: ${fixture} queued behind ${position} job(s).` }));
+}
+
+function priorContext(acc: Record<string, SubAgentResult>) {
+  const entries = Object.entries(acc);
+  return entries.length ? `=== PRIOR EVIDENCE ===\n${entries.map(([n, r]) => `[${n}] ${(r.rawOutput || JSON.stringify(r.data)).slice(0, 1800)}`).join('\n\n')}\n=== END PRIOR EVIDENCE ===` : '';
+}
+
+async function runFixturePipeline(fx: string, index: number, plan: AgentPlan, scheduleContext: string, sessionId: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
+  const results: Record<string, SubAgentResult> = {};
+  for (const tier of [1, 2, 3, 4]) {
+    const tasks = plan.agents.filter(a => a.tier === tier); if (!tasks.length) continue;
+    onStep({ type: 'status', content: `🚦 ${fx} · Tier ${tier}: ${tasks.map(t => t.name).join(' + ')}` });
+    const prior = `${scheduleContext}\n${priorContext(results)}`.trim();
+    const settled = await Promise.allSettled(tasks.map(task => dispatchAgent(task, fx, sport, matchDate, `${sessionId}-${index}-${task.name}`, prior, onStep)));
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i], result = settled[i];
+      if (result.status === 'fulfilled') {
+        results[task.name] = result.value;
+        onStep({ type: result.value.success ? 'thought' : 'error', content: `${result.value.success ? '✅' : '⚠️'} ${fx} · ${task.name} ${result.value.success ? 'complete' : 'failed'}.` });
+      } else {
+        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        results[task.name] = { agentName: task.name, success: false, data: {}, steps: [], rawOutput: '', error };
+        onStep({ type: 'error', content: `💥 ${fx} · ${task.name}: ${error}` });
+      }
+    }
+    const requiredFailed = tasks.filter(t => t.required).some(t => !results[t.name]?.success);
+    if (requiredFailed) onStep({ type: 'error', content: `⛔ ${fx} · Tier ${tier} has missing required evidence; downstream gates remain fail-closed.` });
+  }
+  return results;
+}
+
+function aggregate(name: AgentName, registry: Record<string, Record<string, SubAgentResult>>): SubAgentResult {
+  const raws: string[] = []; const datas: Record<string, unknown> = {}; let successes = 0;
+  for (const fx of Object.keys(registry)) { const result = registry[fx]?.[name]; if (!result) continue; if (result.success) successes++; raws.push(`=== ${fx} ===\n${result.rawOutput || JSON.stringify(result.data)}`); datas[fx] = result.data; }
+  return { agentName: name, success: successes > 0, data: { fixtures: datas }, steps: [], rawOutput: raws.join('\n\n'), error: successes ? '' : `No successful ${name} jobs` };
+}
+
+export async function runOrchestrator(userQuery: string, sessionId: string, onStep: (step: ReActStep) => void): Promise<OrchestratorResult> {
+  const steps: ReActStep[] = [];
+  const emit = (s: ReActStep) => { const x = { ...s, timestamp: new Date().toISOString() }; steps.push(x); onStep(x); };
+  const pool = mistralPool.status(); emit({ type: 'status', content: `🧠 Odessyus initializing — ${pool.total} model keys, ${pool.available} available.` });
+  const parsed = await parseQuery(userQuery);
+  let { fixture, sport, market, matchDate } = parsed;
+  let fixtures: string[] = []; let schedule = '';
+
+  if (!fixture || fixture === 'multiple/open' || fixture === userQuery) {
+    const discovered = await discoverFixtures(userQuery, sport, matchDate, emit);
+    fixtures = discovered.fixtures; schedule = discovered.rawSchedule; if (fixtures.length) fixture = fixtures.join(' | ');
+  }
+  if (!fixtures.length && (fixture === 'multiple/open' || fixture === userQuery)) return { finalAnswer: `NO QUALIFIED FIXTURES: I could not verify any future, not-yet-started fixtures for ${matchDate}.`, steps, success: true, metadata: { fixture, sport, market, matchDate, agentsRun: [] } };
+
+  const plan = await buildPlan(fixture);
+  const registry: Record<string, Record<string, SubAgentResult>> = {};
+  const scheduleContext = schedule ? `=== VERIFIED SCHEDULE ${matchDate} ===\n${schedule.slice(0, 5000)}` : '';
+  const pipelineFixtures = fixtures.length ? fixtures : [fixture];
+
+  // Independent fixture pipelines: each fixture can advance through its own DAG while specialists remain FIFO-bounded globally.
+  let nextIndex = 0;
+  const workerCount = Math.min(MAX_FIXTURE_PIPELINES, pipelineFixtures.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= pipelineFixtures.length) return;
+      const fx = pipelineFixtures[index];
+      registry[fx] = await runFixturePipeline(fx, index, plan, scheduleContext, sessionId, sport, matchDate, emit);
+    }
+  });
+  await Promise.all(workers);
+
+  let portfolio: SubAgentResult = { agentName: 'PortfolioRiskScout', success: false, data: {}, steps: [], rawOutput: '', error: 'not run' };
+  const fixturesForPortfolio = Object.entries(registry).map(([fx, results]) => `=== ${fx} ===\n${priorContext(results)}`).join('\n\n');
+  if (pipelineFixtures.length > 1) portfolio = await dispatchAgent({ name: 'PortfolioRiskScout', focus: 'Review the entire candidate slate for correlation, common factors and concentration.', required: true, tier: 5 }, pipelineFixtures.join(' | '), sport, matchDate, `${sessionId}-portfolio`, fixturesForPortfolio, emit);
+
+  const odds = aggregate('OddsScout', registry);
+  const form = aggregate('FormScout', registry);
+  const injury = aggregate('InjuryIntel', registry);
+  const sentiment = aggregate('SentimentAgent', registry);
+  const lineup = aggregate('LineupScout', registry);
+  const advancedText = [aggregate('RefereeScout', registry).rawOutput, aggregate('TacticalScout', registry).rawOutput, aggregate('MarketMicrostructureScout', registry).rawOutput, aggregate('ModelRiskScout', registry).rawOutput, aggregate('DataQualityScout', registry).rawOutput, portfolio.rawOutput].filter(Boolean).join('\n\n');
+
+  try {
+    const enrichedSentiment = { ...sentiment, rawOutput: [sentiment.rawOutput, '=== ADVANCED EVIDENCE ===', advancedText].join('\n') };
+    const q = await runQuantSynthesis({ userQuery, fixture, sport, market, sessionId, oddsResult: odds, formResult: form, injuryResult: injury, sentimentResult: enrichedSentiment, lineupResult: lineup, advancedText, onStep: emit, isMultiFixture: pipelineFixtures.length > 1, discoveredFixtures: pipelineFixtures });
+    if (!q.success) return { finalAnswer: q.finalAnswer || `⚠️ Synthesis failed: ${q.error || 'unknown error'}`, steps, success: false, error: q.error, metadata: { fixture, sport, market, fixtures: pipelineFixtures } };
+    const predictionId = `${sessionId}-${Date.now()}`;
+    logPrediction({ predictionId, fixture, sport, market, predictedProb: q.trueProb, impliedProb: q.impliedProb, expectedValue: q.expectedValue, isValueBet: q.isValueBet, starRating: q.starRating });
+    emit({ type: 'synthesis', content: `🏆 ${pipelineFixtures.length > 1 ? `Multi-match synthesis complete for ${pipelineFixtures.length} fixtures` : 'Synthesis complete'} · FIFO queues drained · advanced risk gates applied.` });
+    const agentsRun = plan.agents.map(a => a.name); if (portfolio.success) agentsRun.push('PortfolioRiskScout');
+    return { finalAnswer: q.finalAnswer, steps, success: true, metadata: { fixture, sport, market, matchDate, fixtures: pipelineFixtures, predictionId, probability: q.trueProb * 100, confidence: q.confidence, starRating: q.starRating, expectedValue: q.expectedValue, recommendedOdds: q.recommendedOdds, dataCompletenessScore: q.dataCompletenessScore, isValueBet: q.isValueBet, recommendedStake: q.recommendedStake, categoryProbabilities: q.categoryProbabilities, agentPlan: plan.agents, agentsRun, queueSnapshot: fixtureScheduler.snapshot(), researchCache: researchCacheStats(), fixtureRegistry: Object.fromEntries(Object.entries(registry).map(([fx, results]) => [fx, Object.fromEntries(Object.entries(results).map(([name, result]) => [name, result.success]))])), portfolioRisk: portfolio.data, poolStatus: mistralPool.status() } };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { finalAnswer: `⚠️ Synthesis failed: ${msg}`, steps, success: false, error: msg, metadata: { fixture, sport, market, fixtures: pipelineFixtures, queueSnapshot: fixtureScheduler.snapshot() } };
+  }
 }
