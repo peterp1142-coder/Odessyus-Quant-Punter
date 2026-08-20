@@ -1,4 +1,5 @@
 import { query, pool } from './index.js';
+import { initAgentJobsSchema } from './agent-jobs-schema.js';
 
 async function ensurePredictionId(): Promise<void> {
   const [columns] = await pool.query(`SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_KEY FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'predictions' AND COLUMN_NAME = 'id'`) as any;
@@ -6,23 +7,17 @@ async function ensurePredictionId(): Promise<void> {
     console.log('[DB] Migrating predictions: adding missing id column...');
     await pool.execute(`ALTER TABLE predictions ADD COLUMN id VARCHAR(36) NULL`);
   }
-
   await pool.execute(`UPDATE predictions SET id = UUID() WHERE id IS NULL OR TRIM(id) = ''`);
-
   const [idRows] = await pool.query(`SELECT COUNT(*) AS n FROM predictions WHERE id IS NULL OR TRIM(id) = ''`) as any;
   if (Number(idRows?.[0]?.n || 0) > 0) throw new Error('Predictions migration failed: NULL/empty prediction IDs remain');
-
   const [keys] = await pool.query(`SELECT INDEX_NAME, NON_UNIQUE, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns_used FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'predictions' GROUP BY INDEX_NAME, NON_UNIQUE`) as any;
   const hasUniqueId = (keys || []).some((k: any) => Number(k.NON_UNIQUE) === 0 && String(k.columns_used || '').toLowerCase() === 'id');
   if (!hasUniqueId) {
     console.log('[DB] Migrating predictions: adding unique index for id...');
     await pool.execute(`ALTER TABLE predictions ADD UNIQUE INDEX uq_predictions_id (id)`);
   }
-
   const [nullability] = await pool.query(`SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'predictions' AND COLUMN_NAME = 'id' LIMIT 1`) as any;
-  if (String(nullability?.[0]?.IS_NULLABLE || '').toUpperCase() === 'YES') {
-    await pool.execute(`ALTER TABLE predictions MODIFY COLUMN id VARCHAR(36) NOT NULL`);
-  }
+  if (String(nullability?.[0]?.IS_NULLABLE || '').toUpperCase() === 'YES') await pool.execute(`ALTER TABLE predictions MODIFY COLUMN id VARCHAR(36) NOT NULL`);
 }
 
 export async function initSchema() {
@@ -36,5 +31,6 @@ export async function initSchema() {
   const newCols:[string,string][]=[['closing_odds',"DECIMAL(8,3) COMMENT 'market closing odds for our selection'"],['actual_result',"VARCHAR(100) COMMENT 'home_win|draw|away_win|btts_yes|over|under'"],['clv_achieved',"DECIMAL(8,4) COMMENT 'closing line value'"],['roi',"DECIMAL(8,4) COMMENT 'odds-1 if won, -1 if lost, 0 if void'"],['data_completeness_score',"DECIMAL(5,1) COMMENT '0-100 signal completeness'"]];for(const[col,def]of newCols)try{await pool.execute(`ALTER TABLE predictions ADD COLUMN ${col} ${def}`);}catch(e){if((e as{code?:string}).code!=='ER_DUP_FIELDNAME')throw e;}
   await query(`CREATE TABLE IF NOT EXISTS model_feedback (id VARCHAR(36) PRIMARY KEY,prediction_id VARCHAR(36),feature_weights_before JSON,feature_weights_after JSON,clv_achieved DECIMAL(6,4),accuracy_delta DECIMAL(6,4),correction_applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
   await query(`CREATE TABLE IF NOT EXISTS model_calibration (market VARCHAR(500) PRIMARY KEY,method VARCHAR(20) NOT NULL,a DOUBLE NOT NULL,b DOUBLE NOT NULL,samples INT NOT NULL,brier DOUBLE NOT NULL,log_loss DOUBLE NOT NULL,ece DOUBLE NOT NULL,roi DOUBLE NULL,avg_clv DOUBLE NULL,edge_validated TINYINT(1) NOT NULL DEFAULT 0,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+  await initAgentJobsSchema();
   console.log('[DB] Aiven MySQL schema ready — feature vectors + calibration initialized.');
 }
