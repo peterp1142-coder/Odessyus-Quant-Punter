@@ -14,7 +14,8 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_WAIT_MS = 300_000;
 const BASE_BACKOFF_MS = 2_000;
 const CALL_TIMEOUT_MS = 90_000;
-const VISION_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MISTRAL_VISION_CONCURRENCY || 2)));
+const MISTRAL_CONCURRENCY = Math.max(1, Math.min(6, Number(process.env.MISTRAL_CONCURRENCY || 4)));
+const VISION_CONCURRENCY = Math.max(1, Math.min(MISTRAL_CONCURRENCY, Number(process.env.MISTRAL_VISION_CONCURRENCY || 2)));
 
 interface KeyEntry {
   key: string;
@@ -47,6 +48,8 @@ function loadKeys(): KeyEntry[] {
 
 class MistralKeyPool {
   private entries: KeyEntry[];
+  private active = 0;
+  private queue: Array<() => void> = [];
   private visionActive = 0;
   private visionQueue: Array<() => void> = [];
 
@@ -71,49 +74,69 @@ class MistralKeyPool {
     console.warn(`[MistralPool] Key …${entry.key.slice(-6)} rate-limited. Cooled for ${retryAfterMs / 1000}s.`);
   }
 
+  private async acquire(): Promise<void> {
+    if (this.active < MISTRAL_CONCURRENCY) {
+      this.active++;
+      return;
+    }
+    await new Promise<void>(resolve => this.queue.push(resolve));
+    this.active++;
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    const next = this.queue.shift();
+    if (next) next();
+  }
+
   async call<T>(fn: (client: Mistral) => Promise<T>): Promise<T> {
-    const deadline = Date.now() + MAX_WAIT_MS;
-    let attempt = 0;
+    await this.acquire();
+    try {
+      const deadline = Date.now() + MAX_WAIT_MS;
+      let attempt = 0;
 
-    while (Date.now() < deadline) {
-      const entry = this.pick();
-      if (!entry) {
-        const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
-        console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
-      }
-
-      try {
-        entry.uses++;
-        const result = await Promise.race([
-          fn(entry.client),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral call timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
-        ]);
-        return result;
-      } catch (err) {
-        const msg = String(err);
-        const is429 = msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
-        const isTimeout = msg.includes('Mistral call timeout');
-        if (isTimeout) {
-          this.markRateLimited(entry, 15_000);
-          console.warn(`[MistralPool] Key …${entry.key.slice(-6)} timed out. Rotating.`);
-          attempt++;
+      while (Date.now() < deadline) {
+        const entry = this.pick();
+        if (!entry) {
+          const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
+          console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
+          await new Promise(r => setTimeout(r, wait));
           continue;
         }
-        if (!is429) throw err;
 
-        const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
-        const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
-        this.markRateLimited(entry, coolMs);
-        const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
-        attempt++;
-        console.warn(`[MistralPool] Attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
-        await new Promise(r => setTimeout(r, Math.min(backoff, 10_000)));
+        try {
+          entry.uses++;
+          const result = await Promise.race([
+            fn(entry.client),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral call timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
+          ]);
+          return result;
+        } catch (err) {
+          const msg = String(err);
+          const is429 = msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
+          const isTimeout = msg.includes('Mistral call timeout');
+          if (isTimeout) {
+            this.markRateLimited(entry, 15_000);
+            console.warn(`[MistralPool] Key …${entry.key.slice(-6)} timed out. Rotating.`);
+            attempt++;
+            continue;
+          }
+          if (!is429) throw err;
+
+          const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
+          const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
+          this.markRateLimited(entry, coolMs);
+          const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
+          attempt++;
+          console.warn(`[MistralPool] Attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
+          await new Promise(r => setTimeout(r, Math.min(backoff, 10_000)));
+        }
       }
-    }
 
-    throw new Error('[MistralPool] All keys exhausted and max wait exceeded. Request dropped.');
+      throw new Error('[MistralPool] All keys exhausted and max wait exceeded. Request dropped.');
+    } finally {
+      this.release();
+    }
   }
 
   private async acquireVisionSlot(): Promise<void> {
@@ -183,36 +206,41 @@ class MistralKeyPool {
   }
 
   private async rawRequest<T>(fn: (entry: KeyEntry) => Promise<T>): Promise<T> {
-    const deadline = Date.now() + MAX_WAIT_MS;
-    let attempt = 0;
-    while (Date.now() < deadline) {
-      const entry = this.pick();
-      if (!entry) {
-        const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
-        console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
+    await this.acquire();
+    try {
+      const deadline = Date.now() + MAX_WAIT_MS;
+      let attempt = 0;
+      while (Date.now() < deadline) {
+        const entry = this.pick();
+        if (!entry) {
+          const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
+          console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        try {
+          entry.uses++;
+          return await Promise.race([
+            fn(entry),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral vision timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
+          ]);
+        } catch (err) {
+          const msg = String(err);
+          const status = Number((err as Error & { status?: number }).status || 0);
+          const is429 = status === 429 || msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
+          if (!is429) throw err;
+          const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
+          const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
+          this.markRateLimited(entry, coolMs);
+          const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt++);
+          console.warn(`[MistralPool] Vision attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
+          await new Promise(r => setTimeout(r, Math.min(backoff, 10_000)));
+        }
       }
-      try {
-        entry.uses++;
-        return await Promise.race([
-          fn(entry),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral vision timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
-        ]);
-      } catch (err) {
-        const msg = String(err);
-        const status = Number((err as Error & { status?: number }).status || 0);
-        const is429 = status === 429 || msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
-        if (!is429) throw err;
-        const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
-        const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
-        this.markRateLimited(entry, coolMs);
-        const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt++);
-        console.warn(`[MistralPool] Vision attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
-        await new Promise(r => setTimeout(r, Math.min(backoff, 10_000)));
-      }
+      throw new Error('[MistralPool] Vision keys exhausted and max wait exceeded.');
+    } finally {
+      this.release();
     }
-    throw new Error('[MistralPool] Vision keys exhausted and max wait exceeded.');
   }
 
   getClient(): Mistral {
@@ -220,13 +248,15 @@ class MistralKeyPool {
     return entry.client;
   }
 
-  status(): { total: number; available: number; cooled: number; visionActive: number; visionQueued: number } {
+  status(): { total: number; available: number; cooled: number; active: number; queued: number; visionActive: number; visionQueued: number } {
     const now = Date.now();
     const cooled = this.entries.filter(e => e.cooldownUntil > now).length;
     return {
       total: this.entries.length,
       available: this.entries.length - cooled,
       cooled,
+      active: this.active,
+      queued: this.queue.length,
       visionActive: this.visionActive,
       visionQueued: this.visionQueue.length,
     };
