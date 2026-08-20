@@ -7,7 +7,6 @@
     "dev": "npx concurrently \"npm run server\" \"npm run client\"",
     "server": "unset PUPPETEER_TOKEN SCRAPER_TOKEN && tsx watch server/index.ts",
     "client": "vite --port 5000 --host 0.0.0.0",
-    "client": "vite --port 5000 --host 0.0.0.0",
     "build": "npm run build:all",
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
