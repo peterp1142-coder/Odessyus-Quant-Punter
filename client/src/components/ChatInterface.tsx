@@ -13,7 +13,7 @@ const QUICK_PROMPTS = [
 interface ChatInterfaceProps { conversationId: string; initialMessages: ChatMessage[]; onMessagesChange: (messages: ChatMessage[]) => void; onNewChat: () => void; }
 
 export const ChatInterface: React.FC<ChatInterfaceProps> = ({ conversationId, initialMessages, onMessagesChange, onNewChat }) => {
-  const { messages, isStreaming, sendMessage, runPreset, cancelRequest } = useChat({ conversationId, initialMessages, onMessagesChange });
+  const { messages, isStreaming, liveBrowserVisual, sendMessage, runPreset, cancelRequest } = useChat({ conversationId, initialMessages, onMessagesChange });
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -42,27 +42,30 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ conversationId, in
       </div>
 
       <div className="flex-1 overflow-y-auto scrollable">
+        {liveBrowserVisual && isStreaming && (
+          <div className="max-w-3xl mx-auto px-4 pt-4">
+            <div className="rounded-2xl overflow-hidden border border-emerald-500/20 bg-black/40 shadow-xl shadow-black/20">
+              <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-white/[0.06] bg-white/[0.03]">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+                  <span className="text-[11px] font-mono text-emerald-300">LIVE BROWSER VIEW</span>
+                  <span className="text-[10px] text-neutral-600 truncate">{liveBrowserVisual.url || 'local Chromium'}</span>
+                </div>
+                <span className="text-[10px] text-neutral-600 font-mono flex-shrink-0">{new Date(liveBrowserVisual.capturedAt).toLocaleTimeString()}</span>
+              </div>
+              <img src={liveBrowserVisual.image} alt="Live local Chromium browser view" className="block w-full max-h-[420px] object-contain bg-black" />
+            </div>
+          </div>
+        )}
         {isEmpty ? (
           <div className="flex flex-col items-center justify-center h-full px-6 py-10 max-w-3xl mx-auto">
             <div className="mb-7 text-center"><div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-3xl mx-auto mb-5 shadow-2xl shadow-emerald-900/40">⚡</div><h1 className="text-2xl font-bold text-white mb-2">How can I help you?</h1><p className="text-neutral-500 text-sm max-w-sm mx-auto">I'm an autonomous sports forecasting engine. Ask me for predictions, value bets, or match analysis.</p></div>
 
-            {/* One-click quantitative portfolio analysis. The full prompt is server-side and is never inserted into the chat composer. */}
-            <button
-              type="button"
-              onClick={runAccumulator}
-              disabled={isStreaming}
-              className="w-full mb-5 group text-left rounded-2xl border border-emerald-500/20 bg-gradient-to-br from-emerald-500/[0.10] to-teal-500/[0.05] hover:from-emerald-500/[0.16] hover:to-teal-500/[0.09] hover:border-emerald-400/35 disabled:opacity-50 disabled:cursor-not-allowed transition-all p-4 shadow-lg shadow-emerald-950/20"
-            >
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-xl bg-emerald-500/15 border border-emerald-400/20 flex items-center justify-center text-xl">📐</div>
-                <div className="flex-1 min-w-0"><div className="text-sm font-semibold text-emerald-200 group-hover:text-emerald-100">Statistically Plausible Accumulators for Today</div><div className="text-xs text-neutral-500 mt-1">Scans today's fixtures, validates market edge, and builds Safe, Balanced & Aggressive portfolios.</div></div>
-                <div className="text-emerald-400 text-lg group-hover:translate-x-0.5 transition-transform">→</div>
-              </div>
+            <button type="button" onClick={runAccumulator} disabled={isStreaming} className="w-full mb-5 group text-left rounded-2xl border border-emerald-500/20 bg-gradient-to-br from-emerald-500/[0.10] to-teal-500/[0.05] hover:from-emerald-500/[0.16] hover:to-teal-500/[0.09] hover:border-emerald-400/35 disabled:opacity-50 disabled:cursor-not-allowed transition-all p-4 shadow-lg shadow-emerald-950/20">
+              <div className="flex items-center gap-3"><div className="w-11 h-11 rounded-xl bg-emerald-500/15 border border-emerald-400/20 flex items-center justify-center text-xl">📐</div><div className="flex-1 min-w-0"><div className="text-sm font-semibold text-emerald-200 group-hover:text-emerald-100">Statistically Plausible Accumulators for Today</div><div className="text-xs text-neutral-500 mt-1">Scans today's fixtures, validates market edge, and builds Safe, Balanced & Aggressive portfolios.</div></div><div className="text-emerald-400 text-lg group-hover:translate-x-0.5 transition-transform">→</div></div>
             </button>
 
-            <div className="agent-grid">
-              {[{ icon: '📊', label: 'OddsScout', desc: 'Market lines & sharp money' }, { icon: '📈', label: 'FormScout', desc: 'H2H records & xG data' }, { icon: '🏥', label: 'InjuryIntel', desc: 'Lineups & GTD players' }, { icon: '📰', label: 'SentimentAgent', desc: 'News & motivation' }, { icon: '⚡', label: 'QuantSynth', desc: 'Monte Carlo & EV' }].map(a => <div key={a.label} className="flex items-start gap-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl p-3"><span className="text-lg flex-shrink-0 mt-0.5">{a.icon}</span><div><div className="text-xs font-semibold text-neutral-200">{a.label}</div><div className="text-[11px] text-neutral-600 mt-0.5 leading-tight">{a.desc}</div></div></div>)}
-            </div>
+            <div className="agent-grid">{[{ icon: '📊', label: 'OddsScout', desc: 'Market lines & sharp money' }, { icon: '📈', label: 'FormScout', desc: 'H2H records & xG data' }, { icon: '🏥', label: 'InjuryIntel', desc: 'Lineups & GTD players' }, { icon: '📰', label: 'SentimentAgent', desc: 'News & motivation' }, { icon: '⚡', label: 'QuantSynth', desc: 'Monte Carlo & EV' }].map(a => <div key={a.label} className="flex items-start gap-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl p-3"><span className="text-lg flex-shrink-0 mt-0.5">{a.icon}</span><div><div className="text-xs font-semibold text-neutral-200">{a.label}</div><div className="text-[11px] text-neutral-600 mt-0.5 leading-tight">{a.desc}</div></div></div>)}</div>
             <div className="prompt-grid mt-4">{QUICK_PROMPTS.map(p => <button key={p.text} onClick={() => { setInput(p.text); inputRef.current?.focus(); }} className="flex items-center gap-3 px-4 py-3 rounded-xl bg-white/[0.03] border border-white/[0.06] hover:border-white/[0.12] hover:bg-white/[0.06] text-left transition-all group"><span className="text-base">{p.icon}</span><span className="text-xs text-neutral-400 group-hover:text-neutral-200 transition-colors leading-snug">{p.text}</span></button>)}</div>
           </div>
         ) : (
