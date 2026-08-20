@@ -2,6 +2,47 @@ import type { Page } from 'puppeteer-core';
 import { mistralPool } from './mistral-pool.js';
 import { currentVisualSessionId, publishVisual } from './visual-events.js';
 
+const VISUAL_PAGE_READY_TIMEOUT_MS = Math.max(5_000, Math.min(20_000, Number(process.env.VISUAL_PAGE_READY_TIMEOUT_MS || 12_000)));
+const VISUAL_PAINT_SETTLE_MS = Math.max(250, Math.min(2_000, Number(process.env.VISUAL_PAINT_SETTLE_MS || 700)));
+
+/**
+ * Give client-rendered pages a real chance to paint before taking the frame.
+ * `domcontentloaded` is not sufficient for ESPN/365Scores/etc.; their useful
+ * content arrives asynchronously after the initial document is parsed.
+ */
+async function waitForRenderablePage(page: Page): Promise<void> {
+  try {
+    await page.waitForFunction(
+      () => document.readyState === 'interactive' || document.readyState === 'complete',
+      { timeout: VISUAL_PAGE_READY_TIMEOUT_MS },
+    );
+  } catch {
+    // Some heavily scripted pages never report complete; continue to the
+    // content heuristic rather than failing the visual recovery outright.
+  }
+
+  try {
+    await page.waitForFunction(
+      () => {
+        const body = document.body;
+        if (!body) return false;
+        const text = (body.innerText || '').replace(/\s+/g, ' ').trim();
+        const structuralContent = body.querySelector(
+          'main, [role="main"], #content, #main, #root, #app, table, article, section',
+        );
+        return text.length >= 160 || Boolean(structuralContent);
+      },
+      { timeout: VISUAL_PAGE_READY_TIMEOUT_MS },
+    );
+  } catch {
+    // A blocked/empty page is still useful to Mistral: it can identify the
+    // consent/captcha/anti-bot state from the rendered frame.
+  }
+
+  // Allow one browser paint cycle after the DOM/content heuristic succeeds.
+  await new Promise(resolve => setTimeout(resolve, VISUAL_PAINT_SETTLE_MS));
+}
+
 /**
  * Visual recovery reuses the already-open local Chromium page. It is used when
  * the DOM selector is stale or the page structure is ambiguous, not as a
@@ -22,6 +63,20 @@ export async function inspectPageVisually(
 
   let uploadedFileId: string | undefined;
   try {
+    await waitForRenderablePage(page);
+
+    const diagnostics = await page.evaluate(() => ({
+      readyState: document.readyState,
+      title: document.title || '',
+      textLength: (document.body?.innerText || '').trim().length,
+      htmlLength: document.documentElement?.outerHTML?.length || 0,
+      viewport: `${window.innerWidth}x${window.innerHeight}`,
+    })).catch(() => ({ readyState: 'unknown', title: '', textLength: 0, htmlLength: 0, viewport: 'unknown' }));
+
+    console.log(
+      `[VISUAL] Page ready check: readyState=${diagnostics.readyState} text=${diagnostics.textLength} html=${diagnostics.htmlLength} viewport=${diagnostics.viewport} url=${page.url()}`,
+    );
+
     const screenshot = await page.screenshot({
       type: 'jpeg',
       quality: 55,
@@ -43,6 +98,7 @@ export async function inspectPageVisually(
       'Inspect this live sports webpage screenshot and its compact DOM context.',
       hint ? `Original selector/hint: ${hint}.` : '',
       candidateContext ? `Candidate DOM extracts:\n${candidateContext}` : '',
+      `Browser diagnostics: readyState=${diagnostics.readyState}, visibleTextLength=${diagnostics.textLength}, htmlLength=${diagnostics.htmlLength}, viewport=${diagnostics.viewport}.`,
       'Determine whether the page is a real fixture/odds/sports page, blocked/consent/captcha, or unrelated.',
       'If candidate selectors are supplied, identify the BEST_SELECTOR only when one clearly corresponds to the visible fixture/market content.',
       'Use the selector text exactly as supplied; do not invent class names.',
