@@ -127,10 +127,6 @@ async function discoverVisibleCandidates(page: Page, hint: string): Promise<Arra
   }, hint);
 }
 
-async function extract(page: Page, selector: string): Promise<string> {
-  return page.evaluate(sel => Array.from(document.querySelectorAll(sel)).map(e => (e as HTMLElement).innerText || '').join('\n').trim(), selector);
-}
-
 async function executeDecision(page: Page, decision: VisualDecision, allowedSelectors: Set<string>): Promise<boolean> {
   switch (decision.action) {
     case 'WAIT':
@@ -156,6 +152,16 @@ async function executeDecision(page: Page, decision: VisualDecision, allowedSele
   }
 }
 
+async function deleteUploadedFile(fileId: string | undefined): Promise<void> {
+  if (!fileId) return;
+  try {
+    await mistralPool.call(client => client.files.delete({ fileId }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/404|not found/i.test(message)) console.warn('[VISUAL] Could not delete temporary screenshot:', message);
+  }
+}
+
 /**
  * Intent-driven browser vision loop.
  * The browser does not use a fixed "wait N seconds" strategy for visual recovery.
@@ -171,7 +177,6 @@ export async function inspectPageVisually(
   if (process.env.VISUAL_BROWSER_ENABLED === 'false') return '';
 
   let lastUsefulData = '';
-  let uploadedFileId: string | undefined;
 
   try {
     for (let step = 0; step < VISUAL_ACTION_MAX_STEPS; step++) {
@@ -184,17 +189,10 @@ export async function inspectPageVisually(
       const screenshot = await page.screenshot({ type: 'jpeg', quality: 55, fullPage: false, encoding: 'base64' });
 
       if (sessionId) {
-        publishVisual({
-          sessionId,
-          image: `data:image/jpeg;base64,${screenshot}`,
-          url: page.url(),
-          hint,
-        });
+        publishVisual({ sessionId, image: `data:image/jpeg;base64,${screenshot}`, url: page.url(), hint });
       }
 
-      console.log(
-        `[VISUAL] Observe step=${step + 1}/${VISUAL_ACTION_MAX_STEPS} readyState=${diagnostics.readyState} text=${diagnostics.textLength} scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight} url=${page.url()}`,
-      );
+      console.log(`[VISUAL] Observe step=${step + 1}/${VISUAL_ACTION_MAX_STEPS} readyState=${diagnostics.readyState} text=${diagnostics.textLength} scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight} url=${page.url()}`);
 
       const prompt = [
         'You are the visual browser controller for a sports research agent. Behave like a careful human browsing with intent.',
@@ -208,31 +206,30 @@ export async function inspectPageVisually(
         'If the page already contains enough relevant information, choose READY and put the useful extracted information in data.',
         'If it is a consent/captcha/login/anti-bot page that prevents progress, choose BLOCKED.',
         'Never invent facts, teams, odds, times, or selectors.',
+        'Use WAIT because the page is genuinely loading, not as a reflex. Prefer the smallest wait likely to reveal new content.',
         `Return ONLY JSON with this shape: {"action":"READY|WAIT|SCROLL|CLICK|BLOCKED|STOP","waitMs":1500,"scrollY":700,"selector":"#example","reason":"...","data":"..."}. Omit fields that are not relevant.`,
       ].filter(Boolean).join('\n');
 
-      uploadedFileId = undefined;
       const response = await mistralPool.call(async client => {
-        const uploaded = await client.files.upload({
-          file: {
-            fileName: `browser-observation-${Date.now()}.jpg`,
-            content: Buffer.from(screenshot, 'base64'),
-          },
-          purpose: 'ocr',
-        });
-        uploadedFileId = uploaded.id;
-        return client.chat.complete({
-          model: process.env.VISUAL_BROWSER_MODEL || 'mistral-large-latest',
-          temperature: 0,
-          maxTokens: 700,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'file', fileId: uploaded.id },
-            ],
-          }] as any,
-        });
+        let fileId: string | undefined;
+        try {
+          const uploaded = await client.files.upload({
+            file: { fileName: `browser-observation-${Date.now()}.jpg`, content: Buffer.from(screenshot, 'base64') },
+            purpose: 'ocr',
+          });
+          fileId = uploaded.id;
+          return await client.chat.complete({
+            model: process.env.VISUAL_BROWSER_MODEL || 'mistral-large-latest',
+            temperature: 0,
+            maxTokens: 700,
+            messages: [{
+              role: 'user',
+              content: [{ type: 'text', text: prompt }, { type: 'file', fileId: uploaded.id }],
+            }] as any,
+          });
+        } finally {
+          await deleteUploadedFile(fileId);
+        }
       });
 
       const responseText = response.choices?.[0]?.message?.content;
@@ -244,9 +241,7 @@ export async function inspectPageVisually(
       }
 
       console.log(`[VISUAL] Decision action=${decision.action}${decision.waitMs ? ` wait=${decision.waitMs}ms` : ''}${decision.selector ? ` selector=${decision.selector}` : ''}${decision.reason ? ` reason=${decision.reason}` : ''}`);
-
       if (decision.data) lastUsefulData = decision.data;
-
       if (decision.action === 'READY') return decision.data || lastUsefulData;
       if (decision.action === 'BLOCKED') return 'BLOCKED';
       if (decision.action === 'STOP') break;
@@ -262,17 +257,5 @@ export async function inspectPageVisually(
   } catch (error) {
     console.warn('[VISUAL] Intent-driven visual browsing unavailable:', error instanceof Error ? error.message : String(error));
     return lastUsefulData;
-  } finally {
-    if (uploadedFileId) {
-      try {
-        const fileId = uploadedFileId;
-        await mistralPool.call(client => client.files.delete({ fileId }));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!/404|not found/i.test(message)) {
-          console.warn('[VISUAL] Could not delete temporary screenshot:', message);
-        }
-      }
-    }
   }
 }
