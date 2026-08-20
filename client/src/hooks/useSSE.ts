@@ -12,18 +12,18 @@ export interface SSECallbacks {
 export function useSSE() {
   const esRef = useRef<EventSource | null>(null);
 
-  const stream = useCallback((sessionId: string, message: string, callbacks: SSECallbacks, preset?: string) => {
+  const stream = useCallback((jobId: string, message: string, callbacks: SSECallbacks, preset?: string, sessionId?: string) => {
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
 
-    const query = preset
-      ? `preset=${encodeURIComponent(preset)}`
-      : message
-        ? `message=${encodeURIComponent(message)}`
-        : '';
-    const url = `/api/chat/stream/${encodeURIComponent(sessionId)}${query ? `?${query}` : ''}`;
+    const params = new URLSearchParams();
+    if (preset) params.set('preset', preset);
+    if (message) params.set('message', message);
+    if (sessionId) params.set('sessionId', sessionId);
+    const query = params.toString();
+    const url = `/api/chat/stream/${encodeURIComponent(jobId)}${query ? `?${query}` : ''}`;
     const es = new EventSource(url);
     esRef.current = es;
 
@@ -46,10 +46,10 @@ export function useSSE() {
       es.close(); esRef.current = null;
     });
     es.onerror = () => {
-      // Network loss, navigation and refresh only close this observer. The server
-      // continues the background job and a later mount can reconnect to it.
       es.close();
       esRef.current = null;
+      // Network loss, navigation and refresh only close this observer. The server
+      // continues the background job and a later mount can reconnect to it.
     };
     return () => { es.close(); esRef.current = null; };
   }, []);
