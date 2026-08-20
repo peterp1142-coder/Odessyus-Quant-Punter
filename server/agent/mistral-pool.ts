@@ -1,29 +1,34 @@
 /**
  * MistralKeyPool — multi-key rotation with per-key 429 cooldown tracking.
  *
- * Keys are loaded from env vars:
- *   MISTRAL_API_KEY          (primary)
- *   MISTRAL_API_KEY_1        (secondary)
- *   MISTRAL_API_KEY_2        (tertiary)
- *   … up to MISTRAL_API_KEY_9
- *
- * On a 429 the key is cooled-down for `cooldownMs` (default 60 s).
- * If every key is in cooldown the pool waits for the soonest to recover,
- * then retries — it never silently drops a request.
+ * The pool exposes both SDK calls and a raw vision call. The raw vision path is
+ * intentional: the pinned SDK (1.3.x) validates content blocks differently from
+ * the current Mistral vision API. Vision screenshots are therefore sent as
+ * base64 image URLs directly to /v1/chat/completions, which is the documented
+ * vision transport and avoids ephemeral file-ID propagation problems.
  */
 
 import { Mistral } from '@mistralai/mistralai';
 
-const DEFAULT_COOLDOWN_MS = 60_000;   // 60 s per key after a 429
-const MAX_WAIT_MS         = 300_000;  // give up waiting after 5 min total
-const BASE_BACKOFF_MS     = 2_000;    // initial backoff between key attempts
-const CALL_TIMEOUT_MS     = 90_000;   // abort a single hanging Mistral call after 90 s
+const DEFAULT_COOLDOWN_MS = 60_000;
+const MAX_WAIT_MS = 300_000;
+const BASE_BACKOFF_MS = 2_000;
+const CALL_TIMEOUT_MS = 90_000;
+const VISION_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MISTRAL_VISION_CONCURRENCY || 2)));
 
 interface KeyEntry {
   key: string;
   client: Mistral;
-  cooldownUntil: number;   // epoch ms — 0 means immediately available
+  cooldownUntil: number;
   uses: number;
+}
+
+interface VisionRequest {
+  model: string;
+  prompt: string;
+  imageBase64: string;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 function loadKeys(): KeyEntry[] {
@@ -42,21 +47,20 @@ function loadKeys(): KeyEntry[] {
 
 class MistralKeyPool {
   private entries: KeyEntry[];
+  private visionActive = 0;
+  private visionQueue: Array<() => void> = [];
 
   constructor() {
     this.entries = loadKeys();
   }
 
-  /** Pick the entry with the lowest cooldownUntil that is currently available. */
   private pick(): KeyEntry | null {
     const now = Date.now();
     const available = this.entries.filter(e => e.cooldownUntil <= now);
     if (!available.length) return null;
-    // prefer the one used least recently (lowest uses among available)
     return available.reduce((a, b) => (a.uses <= b.uses ? a : b));
   }
 
-  /** Earliest time any key becomes available again (ms from now). */
   private msUntilAvailable(): number {
     const now = Date.now();
     return Math.max(0, Math.min(...this.entries.map(e => e.cooldownUntil - now)));
@@ -67,19 +71,13 @@ class MistralKeyPool {
     console.warn(`[MistralPool] Key …${entry.key.slice(-6)} rate-limited. Cooled for ${retryAfterMs / 1000}s.`);
   }
 
-  /**
-   * Execute `fn(client)` using an available key.
-   * Rotates keys on 429, waits if all are in cooldown, re-throws on other errors.
-   */
   async call<T>(fn: (client: Mistral) => Promise<T>): Promise<T> {
     const deadline = Date.now() + MAX_WAIT_MS;
     let attempt = 0;
 
     while (Date.now() < deadline) {
       const entry = this.pick();
-
       if (!entry) {
-        // All keys in cooldown — wait for the soonest recovery
         const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
         console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
         await new Promise(r => setTimeout(r, wait));
@@ -88,36 +86,26 @@ class MistralKeyPool {
 
       try {
         entry.uses++;
-        // Race the actual API call against a hard timeout so a hanging network
-        // call can never stall the whole agent pipeline indefinitely.
         const result = await Promise.race([
           fn(entry.client),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`Mistral call timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)
-          ),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral call timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
         ]);
         return result;
       } catch (err) {
         const msg = String(err);
-        const is429     = msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
+        const is429 = msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
         const isTimeout = msg.includes('Mistral call timeout');
-
-        // Timeouts: cool the key briefly then rotate — don't propagate as crash
         if (isTimeout) {
-          this.markRateLimited(entry, 15_000); // 15 s cooldown for timeout keys
+          this.markRateLimited(entry, 15_000);
           console.warn(`[MistralPool] Key …${entry.key.slice(-6)} timed out. Rotating.`);
           attempt++;
           continue;
         }
+        if (!is429) throw err;
 
-        if (!is429) throw err; // non-rate-limit, non-timeout errors propagate immediately
-
-        // Parse Retry-After if embedded in the error message
         const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
         const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
         this.markRateLimited(entry, coolMs);
-
-        // Exponential back-off before trying the next key
         const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
         attempt++;
         console.warn(`[MistralPool] Attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
@@ -128,18 +116,121 @@ class MistralKeyPool {
     throw new Error('[MistralPool] All keys exhausted and max wait exceeded. Request dropped.');
   }
 
-  /** Convenience: get a Mistral client for one-off use (returns first available) */
+  private async acquireVisionSlot(): Promise<void> {
+    if (this.visionActive < VISION_CONCURRENCY) {
+      this.visionActive++;
+      return;
+    }
+    await new Promise<void>(resolve => this.visionQueue.push(resolve));
+    this.visionActive++;
+  }
+
+  private releaseVisionSlot(): void {
+    this.visionActive = Math.max(0, this.visionActive - 1);
+    const next = this.visionQueue.shift();
+    if (next) next();
+  }
+
+  /**
+   * Vision transport using the documented base64 image input. This deliberately
+   * avoids uploading a temporary Mistral file because the pinned SDK's `fileId`
+   * message path can race file availability and produced 404/invalid_request_file
+   * errors in production.
+   */
+  async visionComplete(request: VisionRequest): Promise<string> {
+    await this.acquireVisionSlot();
+    try {
+      return await this.rawRequest(async entry => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+        try {
+          const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+            method: 'POST',
+            signal: controller.signal,
+            headers: {
+              Authorization: `Bearer ${entry.key}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: request.model,
+              temperature: request.temperature ?? 0,
+              max_tokens: request.maxTokens ?? 750,
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'text', text: request.prompt },
+                  { type: 'image_url', image_url: `data:image/jpeg;base64,${request.imageBase64}` },
+                ],
+              }],
+            }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const err = new Error(`Mistral vision HTTP ${response.status}: ${JSON.stringify(payload)}`);
+            (err as Error & { status?: number }).status = response.status;
+            throw err;
+          }
+          const content = payload?.choices?.[0]?.message?.content;
+          if (typeof content !== 'string') throw new Error('Mistral vision returned no text content.');
+          return content;
+        } finally {
+          clearTimeout(timer);
+        }
+      });
+    } finally {
+      this.releaseVisionSlot();
+    }
+  }
+
+  private async rawRequest<T>(fn: (entry: KeyEntry) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + MAX_WAIT_MS;
+    let attempt = 0;
+    while (Date.now() < deadline) {
+      const entry = this.pick();
+      if (!entry) {
+        const wait = Math.min(this.msUntilAvailable() + 100, 5_000);
+        console.warn(`[MistralPool] All keys in cooldown. Waiting ${wait}ms…`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      try {
+        entry.uses++;
+        return await Promise.race([
+          fn(entry),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Mistral vision timeout (${CALL_TIMEOUT_MS / 1000}s)`)), CALL_TIMEOUT_MS)),
+        ]);
+      } catch (err) {
+        const msg = String(err);
+        const status = Number((err as Error & { status?: number }).status || 0);
+        const is429 = status === 429 || msg.includes('429') || msg.includes('rate_limited') || msg.includes('Rate limit');
+        if (!is429) throw err;
+        const retryM = msg.match(/retry.?after[:\s]+(\d+)/i);
+        const coolMs = retryM ? parseInt(retryM[1]) * 1_000 : DEFAULT_COOLDOWN_MS;
+        this.markRateLimited(entry, coolMs);
+        const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt++);
+        console.warn(`[MistralPool] Vision attempt ${attempt} failed (429). Backing off ${backoff}ms before next key.`);
+        await new Promise(r => setTimeout(r, Math.min(backoff, 10_000)));
+      }
+    }
+    throw new Error('[MistralPool] Vision keys exhausted and max wait exceeded.');
+  }
+
   getClient(): Mistral {
     const entry = this.pick() ?? this.entries[0];
     return entry.client;
   }
 
-  status(): { total: number; available: number; cooled: number } {
+  status(): { total: number; available: number; cooled: number; visionActive: number; visionQueued: number } {
     const now = Date.now();
     const cooled = this.entries.filter(e => e.cooldownUntil > now).length;
-    return { total: this.entries.length, available: this.entries.length - cooled, cooled };
+    return {
+      total: this.entries.length,
+      available: this.entries.length - cooled,
+      cooled,
+      visionActive: this.visionActive,
+      visionQueued: this.visionQueue.length,
+    };
   }
 }
 
-// Singleton — one pool shared across the whole process
 export const mistralPool = new MistralKeyPool();
