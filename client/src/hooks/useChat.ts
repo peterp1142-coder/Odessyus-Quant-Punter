@@ -41,7 +41,10 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
     setIsStreaming(false);
     setActiveSteps([]);
     reconnectAttemptedRef.current = false;
-  }, [conversationId, initialMessages]);
+  // initialMessages intentionally excluded: the parent updates it as messages change.
+  // Resetting from that prop would interrupt an active task on every streamed step.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
 
   useEffect(() => { onMessagesChange?.(messages); }, [messages, onMessagesChange]);
 
@@ -93,7 +96,9 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
     setIsStreaming(true);
     attachStream(task.sessionId, task.assistantMsgId, '', task.preset);
     return () => { abortRef.current?.(); };
-  }, [conversationId, attachStream, initialMessages]);
+  // initialMessages is only needed for the first mount; it must not be a trigger.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, attachStream]);
 
   const run = useCallback(async (text: string, preset?: string) => {
     if ((!text.trim() && !preset) || isStreaming) return;
@@ -134,9 +139,8 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
   const runPreset = useCallback((preset: string) => run('', preset), [run]);
 
   const cancelRequest = useCallback(() => {
-    // Preserve historical UI control semantics, but do not terminate the
-    // server-side background job. Reconnecting to the same conversation will
-    // continue receiving it.
+    // This only disconnects the browser observer. It intentionally does not
+    // terminate the server-side background task.
     cancel();
     abortRef.current = null;
     setIsStreaming(false);
