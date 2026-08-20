@@ -4,6 +4,7 @@ import { runOrchestrator } from '../agent/orchestrator.js';
 import type { ReActStep } from '../agent/react-engine.js';
 import { query } from '../db/index.js';
 import { getAgentPreset } from '../agent/presets.js';
+import { getLatestVisual, runWithVisualContext } from '../agent/visual-events.js';
 
 const router = Router();
 type JobRow = { id:string; session_id:string; message:string|null; preset:string|null; status:string; steps:string|ReActStep[]|null; final_answer:string|null; error:string|null; result_metadata:string|Record<string,unknown>|null };
@@ -63,13 +64,13 @@ async function persistPrediction(sessionId:string, result:{ finalAnswer:string; 
 async function executeJob(jobId:string, sessionId:string, effectiveMessage:string) {
   try {
     await query(`UPDATE agent_jobs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?`, [jobId]);
-    const result = await runOrchestrator(effectiveMessage, sessionId, async (step:ReActStep) => {
+    const result = await runWithVisualContext(sessionId, () => runOrchestrator(effectiveMessage, sessionId, async (step:ReActStep) => {
       try {
         const rows = await query<{steps:string|null}[]>(`SELECT steps FROM agent_jobs WHERE id=? LIMIT 1`, [jobId]);
         const current = parseJson<ReActStep[]>(rows[0]?.steps, []);
         await query(`UPDATE agent_jobs SET steps=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [JSON.stringify([...current, step]), jobId]);
       } catch (err) { console.warn('[Chat] Job progress save failed:', err); }
-    });
+    }));
 
     let predictionId:string|undefined;
     if (result.success && result.finalAnswer) {
@@ -164,6 +165,12 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   await tick();
   const timer = setInterval(async()=>{ if (res.writableEnded) return; const done=await tick(); if(done){clearInterval(timer);clearInterval(heartbeat);res.end();} },1000);
   req.on('close',()=>{ clearInterval(timer); clearInterval(heartbeat); });
+});
+
+router.get('/visual/:sessionId', async (req:Request,res:Response) => {
+  const visual = getLatestVisual(req.params.sessionId);
+  if (!visual) return res.status(204).end();
+  res.json(visual);
 });
 
 router.get('/history/:sessionId', async (req:Request,res:Response) => {
