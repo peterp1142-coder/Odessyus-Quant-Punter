@@ -6,7 +6,7 @@ import { useSSE } from './useSSE';
 interface UseChatOptions { conversationId: string; initialMessages?: ChatMessage[]; onMessagesChange?: (messages: ChatMessage[]) => void; }
 
 const ACTIVE_TASK_KEY = 'odessyus_active_task';
-type ActiveTask = { sessionId: string; conversationId: string; message: string; preset?: string; assistantMsgId: string };
+type ActiveTask = { jobId: string; sessionId: string; conversationId: string; message: string; preset?: string; assistantMsgId: string };
 
 function readActiveTask(): ActiveTask | null {
   try {
@@ -19,10 +19,10 @@ function writeActiveTask(task: ActiveTask) {
   try { localStorage.setItem(ACTIVE_TASK_KEY, JSON.stringify(task)); } catch { /* ignore quota */ }
 }
 
-function clearActiveTask(sessionId?: string) {
+function clearActiveTask(jobId?: string) {
   try {
     const current = readActiveTask();
-    if (!sessionId || !current || current.sessionId === sessionId) localStorage.removeItem(ACTIVE_TASK_KEY);
+    if (!jobId || !current || current.jobId === jobId) localStorage.removeItem(ACTIVE_TASK_KEY);
   } catch { /* ignore */ }
 }
 
@@ -41,15 +41,14 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
     setIsStreaming(false);
     setActiveSteps([]);
     reconnectAttemptedRef.current = false;
-  // initialMessages intentionally excluded: the parent updates it as messages change.
-  // Resetting from that prop would interrupt an active task on every streamed step.
+  // initialMessages intentionally excluded: parent updates it as messages change.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
 
   useEffect(() => { onMessagesChange?.(messages); }, [messages, onMessagesChange]);
 
-  const attachStream = useCallback((sessionId: string, assistantMsgId: string, message: string, preset?: string) => {
-    const cleanup = stream(sessionId, message, {
+  const attachStream = useCallback((jobId: string, assistantMsgId: string, message: string, preset?: string, sessionId?: string) => {
+    const cleanup = stream(jobId, message, {
       onConnected: () => setIsStreaming(true),
       onStep: (step) => {
         setActiveSteps(prev => [...prev, step]);
@@ -70,21 +69,19 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
           metadata: data.metadata as PredictionMetadata | undefined,
         } : m));
         setActiveSteps([]);
-        clearActiveTask(sessionId);
+        clearActiveTask(jobId);
       },
       onSaved: (data) => setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, predictionId: data.predictionId } : m)),
       onError: (msg) => {
         setIsStreaming(false); setActiveSteps([]);
         setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: `⚠️ ${msg}`, isStreaming: false } : m));
-        clearActiveTask(sessionId);
+        clearActiveTask(jobId);
       },
-    }, preset);
+    }, preset, sessionId);
     abortRef.current = cleanup;
     return cleanup;
   }, [stream]);
 
-  // Reconnect to an already-running server-side task when returning to Chat or
-  // after a full page refresh. The server owns the task; this hook only observes it.
   useEffect(() => {
     if (reconnectAttemptedRef.current) return;
     const task = readActiveTask();
@@ -94,7 +91,7 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
     const assistantExists = initialMessages.some(m => m.id === task.assistantMsgId);
     if (!assistantExists) return;
     setIsStreaming(true);
-    attachStream(task.sessionId, task.assistantMsgId, '', task.preset);
+    attachStream(task.jobId, task.assistantMsgId, '', task.preset, task.sessionId);
     return () => { abortRef.current?.(); };
   // initialMessages is only needed for the first mount; it must not be a trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -114,7 +111,6 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
     setIsStreaming(true);
     setActiveSteps([]);
 
-    let activeSessionId = sessionIdRef.current;
     try {
       const body: Record<string, string> = { sessionId: sessionIdRef.current };
       if (preset) body.preset = preset; else body.message = text.trim();
@@ -122,25 +118,29 @@ export function useChat({ conversationId, initialMessages = [], onMessagesChange
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`Unable to start task (${res.status})`);
-      const data = await res.json() as { sessionId: string };
-      activeSessionId = data.sessionId;
+      const data = await res.json() as { sessionId: string; jobId: string };
       sessionIdRef.current = data.sessionId;
-      writeActiveTask({ sessionId: activeSessionId, conversationId, message: text.trim(), preset, assistantMsgId });
+      writeActiveTask({
+        jobId: data.jobId,
+        sessionId: data.sessionId,
+        conversationId,
+        message: text.trim(),
+        preset,
+        assistantMsgId,
+      });
+      attachStream(data.jobId, assistantMsgId, text.trim(), preset, data.sessionId);
     } catch (err) {
       setIsStreaming(false);
       setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: `⚠️ ${err instanceof Error ? err.message : 'Unable to start task'}`, isStreaming: false } : m));
-      return;
     }
-
-    attachStream(activeSessionId, assistantMsgId, text.trim(), preset);
   }, [conversationId, isStreaming, attachStream]);
 
   const sendMessage = useCallback((text: string) => run(text), [run]);
   const runPreset = useCallback((preset: string) => run('', preset), [run]);
 
   const cancelRequest = useCallback(() => {
-    // This only disconnects the browser observer. It intentionally does not
-    // terminate the server-side background task.
+    // Disconnect the browser observer only. Page refresh/navigation must never
+    // cancel the server-side task.
     cancel();
     abortRef.current = null;
     setIsStreaming(false);
