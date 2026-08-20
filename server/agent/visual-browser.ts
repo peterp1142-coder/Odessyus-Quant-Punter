@@ -7,6 +7,7 @@ const VISUAL_ACTION_MAX_STEPS = Math.max(2, Math.min(6, Number(process.env.VISUA
 const VISUAL_ACTION_MAX_WAIT_MS = Math.max(500, Math.min(6000, Number(process.env.VISUAL_ACTION_MAX_WAIT_MS || 5000)));
 const VISUAL_ACTION_MIN_WAIT_MS = Math.max(150, Math.min(1000, Number(process.env.VISUAL_ACTION_MIN_WAIT_MS || 350)));
 const VISUAL_OBSERVATION_MAX_CHARS = 9000;
+const BLANK_PAGE_MAX_OBSERVATIONS = Math.max(2, Math.min(3, Number(process.env.VISUAL_BLANK_MAX_OBSERVATIONS || 2)));
 
 interface VisualDecision { action:'READY'|'WAIT'|'SCROLL'|'CLICK'|'BLOCKED'|'STOP'; waitMs?:number; scrollY?:number; selector?:string; reason?:string; data?:string; challengeType?:string; confidence?:number; }
 function clamp(value:number,min:number,max:number){return Math.max(min,Math.min(max,value));}
@@ -22,6 +23,8 @@ async function executeDecision(page:Page,decision:VisualDecision,allowedSelector
 export async function inspectPageVisually(page:Page,hint='',candidateContext='',sessionId=currentVisualSessionId()||''):Promise<string>{
   if(process.env.VISUAL_BROWSER_ENABLED==='false')return '';
   let lastUsefulData='';
+  let blankObservations=0;
+  let previousSignature='';
   try{
     for(let step=0;step<VISUAL_ACTION_MAX_STEPS;step++){
       const diagnostics=await pageDiagnostics(page);
@@ -31,33 +34,35 @@ export async function inspectPageVisually(page:Page,hint='',candidateContext='',
       const mergedContext=[candidateContext,liveContext].filter(Boolean).join('\n=== LIVE CANDIDATES ===\n').slice(0,14000);
       const screenshot=await page.screenshot({type:'jpeg',quality:55,fullPage:false,encoding:'base64'});
       if(sessionId)publishVisual({sessionId,image:`data:image/jpeg;base64,${screenshot}`,url:page.url(),hint});
-      console.log(`[VISUAL] Observe step=${step+1}/${VISUAL_ACTION_MAX_STEPS} readyState=${diagnostics.readyState} text=${diagnostics.textLength} scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight} url=${page.url()}`);
+      const signature=`${diagnostics.readyState}|${diagnostics.textLength}|${diagnostics.htmlLength}|${diagnostics.scrollHeight}|${candidates.map(c=>c.selector).join(',')}`;
+      const unchanged=signature===previousSignature;
+      previousSignature=signature;
+      const isBlank=diagnostics.textLength===0 && candidates.length===0;
+      if(isBlank)blankObservations=unchanged?blankObservations+1:1;else blankObservations=0;
+      console.log(`[VISUAL] Observe step=${step+1}/${VISUAL_ACTION_MAX_STEPS} readyState=${diagnostics.readyState} text=${diagnostics.textLength} scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight} blank=${isBlank} unchanged=${unchanged} url=${page.url()}`);
+      if(blankObservations>=BLANK_PAGE_MAX_OBSERVATIONS){
+        console.warn(`[VISUAL] Page remained structurally blank for ${blankObservations} unchanged observations; abandoning visual wait and allowing source fallback.`);
+        return `[VISUAL_SOURCE_UNAVAILABLE]\nPage remained blank after ${blankObservations} unchanged observations at ${page.url()}`;
+      }
 
       const prompt=[
         'You are the visual browser controller for a sports research agent. Behave like a careful human browsing with intent.',
         `Goal: ${hint||'find useful football fixture, market, odds, or schedule information on this page'}.`,
         'Look at the CURRENT screenshot first. Use DOM candidates only as supporting evidence.',
-        `Browser state: readyState=${diagnostics.readyState}; visibleTextLength=${diagnostics.textLength}; scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight}; title=${diagnostics.title||'(none)'}.`,
+        `Browser state: readyState=${diagnostics.readyState}; visibleTextLength=${diagnostics.textLength}; scroll=${diagnostics.scrollY}/${diagnostics.scrollHeight}; title=${diagnostics.title||'(none)'}; blank=${isBlank}; unchanged=${unchanged}.`,
         mergedContext?`Visible candidate DOM:\n${mergedContext}`:'',
-        'If the page is blank, skeleton-loading, spinner-loading, or clearly still rendering, choose WAIT with a sensible waitMs rather than pretending it is ready.',
+        'If the page is blank, skeleton-loading, spinner-loading, or clearly still rendering, choose WAIT only if the page state is changing or the browser is still loading. If blank and unchanged across observations, choose STOP so the source fallback can run.',
         'If content is below the fold, choose SCROLL with a sensible scrollY.',
         'If a visible navigation control is needed to reach the requested content, choose CLICK using EXACTLY one selector from the supplied candidates. Never invent a selector.',
         'If the page already contains enough relevant information, choose READY and put the useful extracted information in data.',
         'If the page is blocked by a CAPTCHA, anti-bot challenge, consent gate, or login wall, choose BLOCKED and identify the challenge type in challengeType.',
         'CAPTCHA POLICY: detect and classify the challenge only. Do not solve it, bypass it, defeat it, or provide automated solving instructions. Set reason to HUMAN_VERIFICATION_REQUIRED.',
         'Never invent facts, teams, odds, times, or selectors.',
-        'Use WAIT because the page is genuinely loading, not as a reflex. Prefer the smallest wait likely to reveal new content.',
+        'Use WAIT because the page is genuinely progressing, not as a reflex. Prefer the smallest wait likely to reveal new content.',
         'Return ONLY JSON: {"action":"READY|WAIT|SCROLL|CLICK|BLOCKED|STOP","waitMs":1500,"scrollY":700,"selector":"#example","reason":"...","challengeType":"reCAPTCHA|hCaptcha|Cloudflare Turnstile|image|checkbox|unknown|none","confidence":0.0,"data":"..."}. Omit irrelevant fields.',
       ].filter(Boolean).join('\n');
 
-      const responseText=await mistralPool.visionComplete({
-        model:process.env.VISUAL_BROWSER_MODEL||'mistral-large-latest',
-        prompt,
-        imageBase64:screenshot,
-        temperature:0,
-        maxTokens:750,
-      });
-
+      const responseText=await mistralPool.visionComplete({model:process.env.VISUAL_BROWSER_MODEL||'mistral-large-latest',prompt,imageBase64:screenshot,temperature:0,maxTokens:750});
       const decision=extractJson(responseText);
       if(!decision){console.warn('[VISUAL] Mistral returned no valid browser decision; stopping visual loop safely.');break;}
       console.log(`[VISUAL] Decision action=${decision.action}${decision.waitMs?` wait=${decision.waitMs}ms`:''}${decision.selector?` selector=${decision.selector}`:''}${decision.challengeType?` challenge=${decision.challengeType}`:''}${decision.reason?` reason=${decision.reason}`:''}`);
@@ -77,6 +82,8 @@ export async function inspectPageVisually(page:Page,hint='',candidateContext='',
         if(!resumed)return `[HUMAN_VERIFICATION_EXPIRED]\nChallenge: ${challenge}`;
         markVerificationResuming(sessionId);
         lastUsefulData='';
+        blankObservations=0;
+        previousSignature='';
         continue;
       }
       if(decision.action==='STOP')break;
