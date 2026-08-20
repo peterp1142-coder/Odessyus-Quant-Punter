@@ -10,6 +10,7 @@ const router = Router();
 type JobStatus = 'running' | 'completed' | 'failed';
 type JobEvent = { event: string; data: unknown };
 type BackgroundJob = {
+  jobId: string;
   sessionId: string;
   message: string;
   preset?: string;
@@ -22,8 +23,8 @@ type BackgroundJob = {
   startedAt: number;
 };
 
-// One process owns the work; SSE connections are only observers. Closing/refreshing
-// the browser therefore never cancels the underlying analysis.
+// A conversation can contain many tasks. jobId is therefore deliberately
+// separate from sessionId. SSE connections are observers only.
 const jobs = new Map<string, BackgroundJob>();
 const JOB_TTL_MS = 30 * 60 * 1000;
 
@@ -39,7 +40,8 @@ async function checkpoint(job: BackgroundJob, status = job.status) {
       `INSERT INTO jobs_state (job_id, status, current_checkpoint)
        VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE status = VALUES(status), current_checkpoint = VALUES(current_checkpoint), last_updated = CURRENT_TIMESTAMP`,
-      [job.sessionId, status, JSON.stringify({
+      [job.jobId, status, JSON.stringify({
+        sessionId: job.sessionId,
         message: job.message,
         preset: job.preset,
         stepCount: job.steps.length,
@@ -99,15 +101,15 @@ async function persistPrediction(job: BackgroundJob, result: { finalAnswer: stri
   emit(job, 'saved', { predictionId: predId });
 }
 
-function startBackgroundJob(sessionId: string, message: string, preset?: string) {
-  const existing = jobs.get(sessionId);
+function startBackgroundJob(jobId: string, sessionId: string, message: string, preset?: string) {
+  const existing = jobs.get(jobId);
   if (existing) return existing;
 
   const job: BackgroundJob = {
-    sessionId, message, preset, status: 'running', steps: [], finalAnswer: '',
+    jobId, sessionId, message, preset, status: 'running', steps: [], finalAnswer: '',
     listeners: new Set(), startedAt: Date.now(),
   };
-  jobs.set(sessionId, job);
+  jobs.set(jobId, job);
   void checkpoint(job, 'running');
 
   void (async () => {
@@ -115,8 +117,6 @@ function startBackgroundJob(sessionId: string, message: string, preset?: string)
       const result = await runOrchestrator(message, sessionId, (step: ReActStep) => {
         job.steps.push(step);
         emit(job, 'step', step);
-        // Do not write every token/step to MySQL. Checkpoint periodically so the
-        // browser can disappear without losing the fact that the task is alive.
         if (job.steps.length === 1 || job.steps.length % 5 === 0) void checkpoint(job, 'running');
       });
 
@@ -153,8 +153,6 @@ function startBackgroundJob(sessionId: string, message: string, preset?: string)
   return job;
 }
 
-// Keep completed jobs around long enough for a refresh/reconnect, then release
-// their listeners and memory. Running jobs are never removed by this timer.
 setInterval(() => {
   const cutoff = Date.now() - JOB_TTL_MS;
   for (const [id, job] of jobs) {
@@ -162,39 +160,36 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
-// POST /api/chat — create/register a background task. The response returns
-// immediately; actual analysis is independent of the browser connection.
 router.post('/', async (req: Request, res: Response) => {
-  const { message, sessionId: existing, preset } = req.body as { message?: string; sessionId?: string; preset?: string };
+  const { message, sessionId: existingSessionId, preset } = req.body as { message?: string; sessionId?: string; preset?: string };
   const internalPreset = preset ? getAgentPreset(preset) : null;
   if (!message?.trim() && !internalPreset) return res.status(400).json({ error: 'Message is required' });
   if (preset && !internalPreset) return res.status(400).json({ error: 'Unknown agent preset' });
 
-  const sessionId = existing || uuidv4();
+  const sessionId = existingSessionId || uuidv4();
   if (message?.trim() && !internalPreset) {
     try {
       await query('INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)', [uuidv4(), sessionId, 'web', 'user', message.trim()]);
     } catch (err) { console.error('[Chat] Save user msg:', err); }
   }
 
-  const job = startBackgroundJob(sessionId, internalPreset || message!.trim(), preset);
-  res.json({ sessionId, status: job.status });
+  const jobId = uuidv4();
+  const job = startBackgroundJob(jobId, sessionId, internalPreset || message!.trim(), preset);
+  res.json({ sessionId, jobId, status: job.status });
 });
 
-// GET /api/chat/stream/:sessionId — SSE is a reconnectable observer, not the job itself.
-router.get('/stream/:sessionId', async (req: Request, res: Response) => {
-  const { sessionId } = req.params;
-  const { message, preset } = req.query as { message?: string; preset?: string };
-  let job = jobs.get(sessionId);
+// GET /api/chat/stream/:jobId — reconnectable SSE observer.
+router.get('/stream/:jobId', async (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  const { message, preset, sessionId } = req.query as { message?: string; preset?: string; sessionId?: string };
+  let job = jobs.get(jobId);
 
   if (!job) {
-    // A fresh browser/tab may reconnect after the process has rebuilt the route.
-    // If the request contains the original message we can safely resume it once.
     const internalPreset = preset ? getAgentPreset(preset) : null;
     const effectiveMessage = internalPreset || message?.trim();
-    if (!effectiveMessage) return res.status(404).json({ error: 'Task not found' });
+    if (!effectiveMessage || !sessionId) return res.status(404).json({ error: 'Task not found' });
     if (preset && !internalPreset) return res.status(400).json({ error: 'Unknown agent preset' });
-    job = startBackgroundJob(sessionId, effectiveMessage, preset);
+    job = startBackgroundJob(jobId, sessionId, effectiveMessage, preset);
   }
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -210,8 +205,7 @@ router.get('/stream/:sessionId', async (req: Request, res: Response) => {
   const listener = ({ event, data }: JobEvent) => sse(event, data);
   job.listeners.add(listener);
 
-  sse('connected', { sessionId, engine: 'orchestrator-v2-background', preset: job.preset, status: job.status });
-  // Replay steps/final state when the browser reconnects after a refresh.
+  sse('connected', { sessionId: job.sessionId, jobId: job.jobId, engine: 'orchestrator-v2-background', preset: job.preset, status: job.status });
   if (job.steps.length) for (const step of job.steps) sse('step', step);
   if (job.status === 'completed') {
     sse('complete', { success: true, finalAnswer: job.finalAnswer, stepCount: job.steps.length, metadata: job.metadata });
@@ -222,7 +216,7 @@ router.get('/stream/:sessionId', async (req: Request, res: Response) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     job?.listeners.delete(listener);
-    // IMPORTANT: do not cancel the job. Refresh/navigation only closes this observer.
+    // Refresh/navigation only closes this observer. The background job continues.
   });
 });
 
