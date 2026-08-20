@@ -4,7 +4,8 @@ import { runOrchestrator } from '../agent/orchestrator.js';
 import type { ReActStep } from '../agent/react-engine.js';
 import { query } from '../db/index.js';
 import { getAgentPreset } from '../agent/presets.js';
-import { getLatestVisual, runWithVisualContext } from '../agent/visual-events.js';
+import { getLatestVisual, runWithVisualContext, markVerificationResuming } from '../agent/visual-events.js';
+import { getVerificationSnapshot, performVerificationAction, requestVerificationResume, getVerificationSession } from '../agent/browser-verification.js';
 
 const router = Router();
 type JobRow = { id:string; session_id:string; message:string|null; preset:string|null; status:string; steps:string|ReActStep[]|null; final_answer:string|null; error:string|null; result_metadata:string|Record<string,unknown>|null };
@@ -90,7 +91,6 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
   }
 }
 
-// POST /api/chat — enqueue a durable background job. The HTTP request is never the lifetime of the agent run.
 router.post('/', async (req:Request,res:Response) => {
   const { message, sessionId: existing, preset } = req.body as { message?:string; sessionId?:string; preset?:string };
   const internalPreset = preset ? getAgentPreset(preset) : null;
@@ -115,7 +115,6 @@ router.post('/', async (req:Request,res:Response) => {
   }
 });
 
-// GET /api/chat/stream/:sessionId — attach to an existing durable job. Empty query means "resume the active job".
 router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   const {sessionId} = req.params;
   const {message, preset} = req.query as {message?:string;preset?:string};
@@ -158,7 +157,7 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
         if (predictionId) sse('saved',{predictionId});
         return true;
       }
-    } catch (err) { if (!connected) sse('error',{message:'Agent stream error'}); }
+    } catch { if (!connected) sse('error',{message:'Agent stream error'}); }
     return false;
   };
 
@@ -171,6 +170,37 @@ router.get('/visual/:sessionId', async (req:Request,res:Response) => {
   const visual = getLatestVisual(req.params.sessionId);
   if (!visual) return res.status(204).end();
   res.json(visual);
+});
+
+router.get('/verification/:sessionId', async (req:Request,res:Response) => {
+  const snapshot = await getVerificationSnapshot(req.params.sessionId);
+  if (!snapshot) return res.status(204).end();
+  res.json(snapshot);
+});
+
+router.post('/verification/action/:sessionId', async (req:Request,res:Response) => {
+  const { sessionId } = req.params;
+  if (!getVerificationSession(sessionId)) return res.status(404).json({error:'No active verification session'});
+  const action = req.body as {type?:string;x?:number;y?:number;deltaY?:number;key?:string;text?:string};
+  const type = action.type;
+  const valid = type === 'click' ? Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.y))
+    : type === 'scroll' ? true
+    : type === 'key' ? typeof action.key === 'string' && action.key.length > 0 && action.key.length <= 32
+    : type === 'text' ? typeof action.text === 'string' && action.text.length <= 1000
+    : false;
+  if (!valid) return res.status(400).json({error:'Invalid verification action'});
+  const ok = await performVerificationAction(sessionId, action as any);
+  if (!ok) return res.status(409).json({error:'Verification action could not be applied'});
+  res.json({ok:true});
+});
+
+router.post('/verification/resume/:sessionId', async (req:Request,res:Response) => {
+  const { sessionId } = req.params;
+  if (!getVerificationSession(sessionId)) return res.status(404).json({error:'No active verification session'});
+  markVerificationResuming(sessionId);
+  const resumed = requestVerificationResume(sessionId);
+  if (!resumed) return res.status(404).json({ error: 'Verification session is no longer available.' });
+  res.json({ sessionId, status: 'resuming' });
 });
 
 router.get('/history/:sessionId', async (req:Request,res:Response) => {
