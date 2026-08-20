@@ -1,0 +1,70 @@
+name: Complete browser-first wiring
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  repair-browser-path:
+    if: ${{ !contains(github.event.head_commit.message, '[browser-wiring]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Patch browser resource policy and fetch path
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          p = Path('server/agent/tools.ts')
+          s = p.read_text()
+
+          old_block = "if(['image','stylesheet','font','media','websocket'].includes(type))req.abort(); else req.continue();"
+          new_block = "if(['image','font','media','websocket'].includes(type))req.abort(); else req.continue();"
+          if old_block not in s:
+              raise SystemExit('configureBrowserPage resource policy pattern not found')
+          s = s.replace(old_block, new_block, 1)
+
+          old_fetch = re.compile(r"export async function fetchUrl\(url:string,useMobile=false\):Promise<ToolResult>\{.*?\}\n\nlet browser: Browser \| null = null;", re.S)
+          new_fetch = '''export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>{
+  try{
+    const browserResult=await scrape(url,'body',Math.min(Number(process.env.BROWSER_FETCH_WAIT_MS||2500),10000));
+    if(browserResult.success)return{...browserResult,source:'fetch_url:local-browser'};
+    if(browserResult.blocked)return browserResult;
+  }catch{}
+  try{
+    const r=await fetchWithTimeout(url,{headers:{...BROWSER_HEADERS,'User-Agent':useMobile?MOBILE_UA:DESKTOP_UA}},FETCH_TIMEOUT);
+    if(!r.ok)return{success:false,data:'',error:`HTTP ${r.status}`,source:'fetch_url:http-fallback'};
+    const $=cheerio.load(await r.text());
+    $('script,style,nav,header,footer,.ad,.ads,.cookie-banner,[class*="cookie"],[id*="cookie"]').remove();
+    const text=$('body').text().replace(/\\s+/g,' ').trim();
+    return text.length>=100?{success:true,data:truncate(text),source:'fetch_url:http-fallback'}:{success:false,data:'',error:'Page too short or empty',source:'fetch_url:http-fallback'};
+  }catch(e){return{success:false,data:'',error:String(e),source:'fetch_url:http-fallback'}}
+}
+
+let browser: Browser | null = null;'''
+          ns, count = old_fetch.subn(new_fetch, s, count=1)
+          if count != 1:
+              raise SystemExit('fetchUrl function pattern not found')
+          p.write_text(ns)
+
+      - name: Verify TypeScript
+        run: |
+          npm install --no-audit --no-fund
+          npm run build:server
+
+      - name: Commit browser-first wiring
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/agent/tools.ts
+          git diff --cached --quiet && exit 0
+          git commit -m "[browser-wiring] Make rendered Chromium primary web retrieval path"
+          git push origin main
