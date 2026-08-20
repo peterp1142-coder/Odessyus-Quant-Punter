@@ -3,12 +3,14 @@ import { v4 as uuidv4 } from 'uuid';
 import type { ChatMessage, ReActStep, PredictionMetadata } from '../types';
 import { useSSE } from './useSSE';
 
+interface LiveBrowserVisual { image:string; url?:string; hint?:string; capturedAt:string; }
 interface UseChatOptions { conversationId:string; initialMessages?:ChatMessage[]; onMessagesChange?:(messages:ChatMessage[])=>void; }
 
 export function useChat({conversationId,initialMessages=[],onMessagesChange}:UseChatOptions) {
   const [messages,setMessages]=useState<ChatMessage[]>(initialMessages);
   const [isStreaming,setIsStreaming]=useState(false);
   const [activeSteps,setActiveSteps]=useState<ReActStep[]>([]);
+  const [liveBrowserVisual,setLiveBrowserVisual]=useState<LiveBrowserVisual|null>(null);
   const {stream,cancel}=useSSE();
   const abortRef=useRef<(()=>void)|null>(null);
   const sessionIdRef=useRef(conversationId);
@@ -18,11 +20,32 @@ export function useChat({conversationId,initialMessages=[],onMessagesChange}:Use
     sessionIdRef.current=conversationId;
     setMessages(initialMessages);
     setActiveSteps([]);
+    setLiveBrowserVisual(null);
     const pending=initialMessages.find(m=>m.isStreaming && m.role==='assistant');
     streamingIdRef.current=pending?.id || null;
     setIsStreaming(Boolean(pending));
   },[conversationId]);
   useEffect(()=>{onMessagesChange?.(messages);},[messages,onMessagesChange]);
+
+  // Live screenshots are intentionally ephemeral UI state, not chat history.
+  // Polling lets the dashboard show the latest local-Chromium frame even after
+  // an SSE reconnect or page refresh while the durable background job continues.
+  useEffect(()=>{
+    if(!isStreaming) return;
+    let stopped=false;
+    const poll=async()=>{
+      try{
+        const res=await fetch(`/api/chat/visual/${encodeURIComponent(sessionIdRef.current)}`,{cache:'no-store'});
+        if(res.status===204)return;
+        if(!res.ok)return;
+        const visual=await res.json() as LiveBrowserVisual;
+        if(!stopped && visual.image)setLiveBrowserVisual(visual);
+      }catch{/* dashboard visual polling is best-effort */}
+    };
+    void poll();
+    const timer=window.setInterval(()=>void poll(),900);
+    return()=>{stopped=true;window.clearInterval(timer);};
+  },[isStreaming]);
 
   const attachToJob=useCallback((sessionId:string,assistantMsgId:string)=>{
     sessionIdRef.current=sessionId;
@@ -69,7 +92,7 @@ export function useChat({conversationId,initialMessages=[],onMessagesChange}:Use
     streamingIdRef.current=assistantMsgId;
     const assistantMsg:ChatMessage={id:assistantMsgId,role:'assistant',content:'',timestamp:new Date().toISOString(),isStreaming:true,steps:[]};
     const userMsg:ChatMessage|null=preset?null:{id:uuidv4(),role:'user',content:text.trim(),timestamp:new Date().toISOString()};
-    setMessages(prev=>[...prev,...(userMsg?[userMsg]:[]),assistantMsg]);setIsStreaming(true);setActiveSteps([]);
+    setMessages(prev=>[...prev,...(userMsg?[userMsg]:[]),assistantMsg]);setIsStreaming(true);setActiveSteps([]);setLiveBrowserVisual(null);
 
     try{
       const body:Record<string,string>={sessionId:sessionIdRef.current};
@@ -90,5 +113,5 @@ export function useChat({conversationId,initialMessages=[],onMessagesChange}:Use
     cancel();abortRef.current?.();abortRef.current=null;setIsStreaming(false);setActiveSteps([]);
     setMessages(prev=>prev.map(m=>m.isStreaming?{...m,content:'⚠️ Stream disconnected. The background job continues running; reopen this chat to reconnect.',isStreaming:false}:m));
   },[cancel]);
-  return {messages,isStreaming,activeSteps,sendMessage,runPreset,cancelRequest};
+  return {messages,isStreaming,activeSteps,liveBrowserVisual,sendMessage,runPreset,cancelRequest};
 }
