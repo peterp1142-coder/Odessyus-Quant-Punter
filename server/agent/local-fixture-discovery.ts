@@ -4,26 +4,51 @@ const DISCOVERY_SOURCES = LIVE_MATCH_SOURCES.filter((url) =>
   /flashscore|sofascore|livescore|bbc\.com\/sport\/football|skysports|footystats|soccerway|365scores|scoreboard|espn\.com\/soccer|goal\.com\/en\/fixtures|oddsportal|betexplorer|oddschecker|fotmob/i.test(url),
 );
 const MAX_SOURCE_CHARS = 7000;
-// Render's 512 MB instance limit makes six simultaneous Chromium pages too expensive.
-// Keep parallelism, but default to two pages and never allow an accidental high setting.
 const CONFIGURED_CONCURRENCY = Number(process.env.LOCAL_DISCOVERY_CONCURRENCY || 2);
-const SOURCE_CONCURRENCY = Math.max(1, Math.min(3, Number.isFinite(CONFIGURED_CONCURRENCY) ? CONFIGURED_CONCURRENCY : 2));
-const WAIT_MS = Math.max(1500, Math.min(5000, Number(process.env.LOCAL_DISCOVERY_WAIT_MS || 3500)));
+const SOURCE_CONCURRENCY = Math.max(1, Math.min(2, Number.isFinite(CONFIGURED_CONCURRENCY) ? CONFIGURED_CONCURRENCY : 2));
+const WAIT_MS = Math.max(2500, Math.min(8000, Number(process.env.LOCAL_DISCOVERY_WAIT_MS || 4500)));
 const RSS_HIGH_WATER_MARK = 430 * 1024 * 1024;
 
+/**
+ * Sites expose fixture data through different containers. Start with
+ * source-specific semantic selectors instead of blindly asking for `body`.
+ * The shared scrape() routine still inspects the live DOM and recovers a
+ * selector when the site changes.
+ */
+const SOURCE_SELECTORS: Array<[RegExp, string]> = [
+  [/flashscore/i, '#main, main, [role="main"], body'],
+  [/sofascore/i, 'main, [role="main"], #content, body'],
+  [/livescore/i, 'main, [role="main"], #main, body'],
+  [/bbc\.com\/sport\/football/i, 'main, [role="main"], #main-content, body'],
+  [/skysports/i, 'main, [role="main"], #main, body'],
+  [/footystats/i, 'main, [role="main"], .container, body'],
+  [/soccerway/i, '#page_team_1_block_team_matches_10, table.match-table, main, .container, body'],
+  [/365scores/i, 'main, [role="main"], #root, .container, body'],
+  [/scoreboard\.com/i, 'main, [role="main"], #content, .container, body'],
+  [/espn\.com\/soccer/i, 'main, [role="main"], #content, #global-viewport, body'],
+  [/goal\.com\/en\/fixtures/i, 'main, [role="main"], #content, .page, body'],
+  [/oddsportal/i, 'div.main-bgcolor, main, [role="main"], body'],
+  [/betexplorer/i, 'main, [role="main"], #content, body'],
+  [/oddschecker/i, 'main, [role="main"], #app, body'],
+  [/fotmob/i, 'main, [role="main"], #__next, body'],
+];
+
+function selectorsFor(url: string): string {
+  return SOURCE_SELECTORS.find(([pattern]) => pattern.test(url))?.[1]
+    || 'main, [role="main"], #content, #app, #root, body';
+}
+
 function concurrencyForBatch(): number {
-  const rss = process.memoryUsage().rss;
-  // If Node is already close to Render's 512 MB ceiling, finish the current work
-  // with a single browser page rather than opening more Chromium renderer processes.
-  return rss >= RSS_HIGH_WATER_MARK ? 1 : SOURCE_CONCURRENCY;
+  return process.memoryUsage().rss >= RSS_HIGH_WATER_MARK ? 1 : SOURCE_CONCURRENCY;
 }
 
 async function scrapeSource(url: string, matchDate: string): Promise<ToolResult> {
-  const result = await scrape(url, 'body', WAIT_MS);
+  const selector = selectorsFor(url);
+  const result = await scrape(url, selector, WAIT_MS);
   if (!result.success) return result;
   return {
     ...result,
-    data: `[LOCAL BROWSER DISCOVERY | ${matchDate} | ${url}]\n${result.data.slice(0, MAX_SOURCE_CHARS)}`,
+    data: `[LOCAL BROWSER DISCOVERY | ${matchDate} | ${url} | selector=${selector}]\n${result.data.slice(0, MAX_SOURCE_CHARS)}`,
     source: 'local-browser-fixture-discovery',
   };
 }
@@ -56,8 +81,8 @@ export async function localBrowserFixtureDiscovery(matchDate: string, sport = 'f
       }
     });
 
-    // Give V8/Chromium a chance to release renderer resources between batches.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Give Chromium/V8 a chance to reclaim renderer resources between batches.
+    await new Promise((resolve) => setTimeout(resolve, 150));
   }
 
   if (!successful.length) {
