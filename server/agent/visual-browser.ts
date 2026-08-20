@@ -1,16 +1,22 @@
 import type { Page } from 'puppeteer-core';
 import { mistralPool } from './mistral-pool.js';
+import { publishVisual } from './visual-events.js';
 
 /**
  * Visual recovery reuses the already-open local Chromium page. It is used when
  * the DOM selector is stale or the page structure is ambiguous, not as a
  * source of fabricated facts. The model is shown the screenshot plus compact
  * DOM candidates so it can help rank the live page structure like a human.
+ *
+ * The screenshot is also published to the authenticated dashboard while this
+ * inspection is running. It is deliberately kept out of the durable job trace
+ * so a sequence of screenshots cannot bloat MySQL or the agent checkpoint.
  */
 export async function inspectPageVisually(
   page: Page,
   hint = '',
   candidateContext = '',
+  sessionId = '',
 ): Promise<string> {
   if (process.env.VISUAL_BROWSER_ENABLED === 'false') return '';
 
@@ -22,6 +28,16 @@ export async function inspectPageVisually(
       fullPage: false,
       encoding: 'base64',
     });
+
+    if (sessionId) {
+      publishVisual({
+        sessionId,
+        image: `data:image/jpeg;base64,${screenshot}`,
+        url: page.url(),
+        hint,
+      });
+      console.log(`[VISUAL] Live screenshot published to dashboard: ${page.url()}`);
+    }
 
     const prompt = [
       'Inspect this live sports webpage screenshot and its compact DOM context.',
@@ -72,8 +88,6 @@ export async function inspectPageVisually(
         const fileId = uploadedFileId;
         await mistralPool.call(client => client.files.delete({ fileId }));
       } catch (error) {
-        // Mistral may have already reclaimed the short-lived upload. A 404 is
-        // harmless and should never pollute the browser recovery logs.
         const message = error instanceof Error ? error.message : String(error);
         if (!/404|not found/i.test(message)) {
           console.warn('[VISUAL] Could not delete temporary screenshot:', message);
