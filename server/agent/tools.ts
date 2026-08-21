@@ -3,6 +3,7 @@ import puppeteer, { type Browser, type BrowserContext, type Page } from 'puppete
 import fs from 'node:fs';
 import path from 'node:path';
 import { inspectPageVisually } from './visual-browser.js';
+import { duckDuckGoFeedSearch } from './duckduckgo-feed.js';
 
 const DUCKDUCKGO_URL = 'https://html.duckduckgo.com/html/';
 const TALORDATA_SERP = 'https://serpapi.talordata.net/serp/v1/request';
@@ -307,6 +308,7 @@ function fallbackQuery(url:string,input:Record<string,unknown>){const base=Strin
 export async function dispatchTool(toolName:string,input:Record<string,unknown>):Promise<ToolResult>{
   console.log(`[TOOL] ${toolName}:`,JSON.stringify(input).slice(0,180));
   switch(toolName){
+    case 'duckduckgo_feed': return duckDuckGoFeedSearch(String(input.query || ''));
     case 'web_search':return webSearch(String(input.query||''));
     case 'serper_search':return serpSearch(String(input.query||''));
     case 'talordata_search':return taloredataSearch(String(input.query||''));
