@@ -1,4 +1,4 @@
-import { serpSearch, taloredataSearch, webSearch } from './tools.js';
+import { serpSearch, taloredataSearch, webSearch, fetchUrl } from './tools.js';
 
 export interface ManagerIntel {
   player: string;
@@ -42,20 +42,46 @@ function classify(text: string) {
   };
 }
 
+function extractUrls(text: string): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.match(/https?:\/\/[^\s<>"'\)\]]+/g) || []) {
+    const url = raw.replace(/[.,;]+$/g, '');
+    if (!seen.has(url)) { seen.add(url); urls.push(url); }
+    if (urls.length >= 8) break;
+  }
+  return urls;
+}
+
 async function search(query: string) {
   const results = await Promise.allSettled([serpSearch(query), taloredataSearch(query), webSearch(query)]);
-  return results
-    .filter(r => r.status === 'fulfilled' && r.value.success)
-    .map(r => (r as PromiseFulfilledResult<any>).value.data)
+  const searchBlocks = results
+    .filter(r => r.status === 'fulfilled' && r.value.success && r.value.data)
+    .map(r => (r as PromiseFulfilledResult<any>).value.data as string);
+
+  if (!searchBlocks.length) return '';
+
+  // Search APIs find candidate pages; Node fetch then hydrates those URLs. No Chromium is used.
+  const urls = [...new Set(searchBlocks.flatMap(extractUrls))].slice(0, 8);
+  const pages = await Promise.allSettled(urls.map(url => fetchUrl(url)));
+  const fetchedBlocks: string[] = [];
+  for (let i = 0; i < pages.length; i++) {
+    const r = pages[i];
+    if (r.status === 'fulfilled' && r.value.success && !r.value.blocked) {
+      fetchedBlocks.push(`=== FETCHED SOURCE ${urls[i]} ===\n${r.value.data.slice(0, 5000)}`);
+    }
+  }
+
+  return [...searchBlocks.map((s, i) => `=== SEARCH SOURCE ${i + 1} ===\n${s.slice(0, 5000)}`), ...fetchedBlocks]
     .join('\n--- INDEPENDENT SOURCE ---\n')
-    .slice(0, 9000);
+    .slice(0, 14000);
 }
 
 export async function analyzeFplManagerIntel(
   players: Array<{ player: string; club: string }>
 ): Promise<{ success: boolean; data: ManagerIntel[]; source: string; error?: string }> {
   const out: ManagerIntel[] = [];
-  for (const item of players.slice(0, 20)) {
+  for (const item of players.slice(0, 120)) {
     try {
       const q = `${item.player} ${item.club} manager press conference 2026/27 FPL start role minutes rotation injury set pieces site:premierleague.com OR site:${item.club.toLowerCase().replace(/\s+/g, '')}.com`;
       const evidence = await search(q);
@@ -70,7 +96,7 @@ export async function analyzeFplManagerIntel(
       out.push({
         ...item,
         ...c,
-        latestEvidence: evidence.split('\n--- INDEPENDENT SOURCE ---\n').filter(Boolean).slice(0, 3),
+        latestEvidence: evidence.split('\n--- INDEPENDENT SOURCE ---\n').filter(Boolean).slice(0, 4),
         freshnessDays,
         confidence
       });
