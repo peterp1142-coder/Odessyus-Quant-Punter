@@ -1,0 +1,83 @@
+name: Wire DuckDuckGo lightweight research feed
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: ${{ !contains(github.event.head_commit.message, '[ddg-feed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Wire feed into specialist runtime and prompts
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+
+          # base.ts: allow specialists to call the dedicated lightweight DDG feed
+          p = Path('server/agent/subagents/base.ts')
+          s = p.read_text()
+          if "import { duckDuckGoFeedSearch }" not in s:
+              s = s.replace("import { getResearch, setResearch } from '../research-cache.js';", "import { getResearch, setResearch } from '../research-cache.js';\nimport { duckDuckGoFeedSearch } from '../duckduckgo-feed.js';", 1)
+          if "duckduckgo_feed:" not in s:
+              marker = "const CHANGE_APPROACH_HINTS:Record<string,string>={"
+              s = s.replace(marker, "const CHANGE_APPROACH_HINTS:Record<string,string>={duckduckgo_feed:'Use DuckDuckGo lightweight search results with a different query; do not retry the same query. ',", 1)
+          old = "const cacheable=new Set(['serper_search','talordata_search','web_search','fetch_url','scrape','scrape_flashscore','fetch_matches_today','allsports_fixtures','fpl_weekly_team']);"
+          new = "const cacheable=new Set(['serper_search','talordata_search','web_search','duckduckgo_feed','fetch_url','scrape','scrape_flashscore','fetch_matches_today','allsports_fixtures','fpl_weekly_team']);"
+          s = s.replace(old, new, 1)
+          needle = "let result:any;if(toolName==='fetch_url'&&typeof input.url==='string'){"
+          if "toolName==='duckduckgo_feed'" not in s:
+              s = s.replace(needle, "let result:any;if(toolName==='duckduckgo_feed'&&typeof input.query==='string'){result=await duckDuckGoFeedSearch(input.query);}else if(toolName==='fetch_url'&&typeof input.url==='string'){", 1)
+          p.write_text(s)
+
+          # prompts.ts: expose feed and make it an explicit third web-research source.
+          p = Path('server/agent/prompts.ts')
+          s = p.read_text()
+          if 'duckduckgo_feed' not in s:
+              s = s.replace("3. web_search           — {\"query\": \"...\"} — DuckDuckGo fallback (no API key required)", "3. web_search           — {\"query\": \"...\"} — DuckDuckGo broad fallback\n4. duckduckgo_feed      — {\"query\": \"...\"} — lightweight DuckDuckGo result feed (HTML/Lite, no browser)", 1)
+              s = s.replace("4. fetch_url", "5. fetch_url", 1).replace("5. scrape", "6. scrape", 1).replace("6. book_slip", "7. book_slip", 1).replace("7. fetch_matches_today", "8. fetch_matches_today", 1).replace("8. allsports_fixtures", "9. allsports_fixtures", 1).replace("9. allsports_livescore", "10. allsports_livescore", 1).replace("10. multi_source_odds", "11. multi_source_odds", 1).replace("11. fetch_fbref_stats", "12. fetch_fbref_stats", 1).replace("12. fetch_understat_xg", "13. fetch_understat_xg", 1).replace("13. fetch_lineups", "14. fetch_lineups", 1).replace("14. calculate_kelly", "15. calculate_kelly", 1).replace("15. fpl_weekly_team", "16. fpl_weekly_team", 1)
+          if 'DuckDuckGo lightweight feed' not in s:
+              s = s.replace('The local browser and scraper are temporarily DISABLED.', 'The local browser and scraper are temporarily DISABLED. Use DuckDuckGo lightweight feed alongside Serper/Talordata for independent search coverage; it is a discovery/evidence channel, not an authoritative odds or fixture database.')
+          s = s.replace('For search: serper_search first, talordata_search second, web_search last resort', 'For search: fan out across serper_search, talordata_search, duckduckgo_feed, then web_search; deduplicate results and prefer independent agreement')
+          p.write_text(s)
+
+          # tools.ts dispatcher: explicit feed tool, even though browser is paused.
+          p = Path('server/agent/tools.ts')
+          s = p.read_text()
+          if "import { duckDuckGoFeedSearch }" not in s:
+              s = s.replace("import { inspectPageVisually } from './visual-browser.js';", "import { inspectPageVisually } from './visual-browser.js';\nimport { duckDuckGoFeedSearch } from './duckduckgo-feed.js';", 1)
+          if "case 'duckduckgo_feed'" not in s:
+              marker = "case 'web_search':"
+              if marker in s:
+                  s = s.replace(marker, "case 'duckduckgo_feed': return duckDuckGoFeedSearch(String(input.query || ''));\n    case 'web_search':", 1)
+          p.write_text(s)
+
+          # package bump.
+          p = Path('package.json')
+          pkg = json.loads(p.read_text())
+          pkg['version'] = '2.1.2'
+          p.write_text(json.dumps(pkg, indent=2) + '\n')
+
+      - name: Build validation
+        run: |
+          npm install --no-audit --no-fund
+          npm run build:client
+          npm run build:server
+
+      - name: Commit feed wiring
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/agent/duckduckgo-feed.ts server/agent/tools.ts server/agent/subagents/base.ts server/agent/prompts.ts package.json package-lock.json
+          git diff --cached --quiet && exit 0
+          git commit -m "[ddg-feed] wire DuckDuckGo lightweight research feed"
+          git push origin main
