@@ -3,7 +3,8 @@ import path from 'node:path';
 
 const toolsTarget = path.resolve('dist-server/agent/tools.js');
 const orchestratorTarget = path.resolve('dist-server/agent/orchestrator.js');
-for (const target of [toolsTarget, orchestratorTarget]) {
+const promptsTarget = path.resolve('dist-server/agent/prompts.js');
+for (const target of [toolsTarget, orchestratorTarget, promptsTarget]) {
   if (!fs.existsSync(target)) throw new Error(`Compiled target not found: ${target}`);
 }
 
@@ -15,21 +16,9 @@ function replaceOnce(source, label, pattern, replacement) {
 const searchOnly = "process.env.SEARCH_ONLY_MODE === 'true'";
 
 let tools = fs.readFileSync(toolsTarget, 'utf8');
-tools = replaceOnce(
-  tools,
-  'getBrowser guard',
-  /async function getBrowser\(\)\{/,
-  `async function getBrowser(){if(${searchOnly})throw new Error('Browser disabled by SEARCH_ONLY_MODE');`
-);
-tools = replaceOnce(
-  tools,
-  'scrape guard',
-  /export async function scrape\(url,selector,waitTime=7000\)\{/,
-  `export async function scrape(url,selector,waitTime=7000){if(${searchOnly})return{success:false,data:'',error:'scrape disabled by SEARCH_ONLY_MODE',blocked:true,source:'scrape:search-only'};`
-);
+tools = replaceOnce(tools,'getBrowser guard',/async function getBrowser\(\)\{/,`async function getBrowser(){if(${searchOnly})throw new Error('Browser disabled by SEARCH_ONLY_MODE');`);
+tools = replaceOnce(tools,'scrape guard',/export async function scrape\(url,selector,waitTime=7000\)\{/,`export async function scrape(url,selector,waitTime=7000){if(${searchOnly})return{success:false,data:'',error:'scrape disabled by SEARCH_ONLY_MODE',blocked:true,source:'scrape:search-only'};`);
 
-// fetch_matches_today is intentionally native-fetch based in SEARCH_ONLY_MODE:
-// search APIs discover candidate source URLs, then Node fetchUrl retrieves page text.
 tools = replaceOnce(
   tools,
   'fetchMatchesToday implementation',
@@ -56,20 +45,9 @@ export async function multiSourceOdds`
 
 const blockedTools = ['scrape','book_slip','scrape_flashscore','multi_source_odds','fetch_fbref_stats','fetch_understat_xg','fetch_lineups'];
 const names = blockedTools.map(name => `'${name}'`).join(',');
-tools = replaceOnce(
-  tools,
-  'dispatch guard',
-  /export async function dispatchTool\(toolName,input\)\{\n\s*console\.log\(/,
-  `export async function dispatchTool(toolName,input){if(${searchOnly}&&[${names}].includes(toolName))return{success:false,data:'',error:\`Tool disabled in SEARCH_ONLY_MODE: \${toolName}\`,blocked:true,source:'search-only'};\nconsole.log(`
-);
-
-tools = replaceOnce(
-  tools,
-  'FPL dispatch case',
-  /case 'calculate_kelly':return calculateKelly\(Number\(input\.true_probability\|\|input\.prob\|\|0\),Number\(input\.decimal_odds\|\|input\.odds\|\|0\),Number\(input\.bankroll\|\|1000\)\);/,
-  `case 'calculate_kelly':return calculateKelly(Number(input.true_probability||input.prob||0),Number(input.decimal_odds||input.odds||0),Number(input.bankroll||1000));
-    case 'fpl_weekly_team':{const {buildFplWeeklyTeam}=await import('./fpl.js');return buildFplWeeklyTeam(input);}`
-);
+tools = replaceOnce(tools,'dispatch guard',/export async function dispatchTool\(toolName,input\)\{\n\s*console\.log\(/,`export async function dispatchTool(toolName,input){if(${searchOnly}&&[${names}].includes(toolName))return{success:false,data:'',error:\`Tool disabled in SEARCH_ONLY_MODE: \${toolName}\`,blocked:true,source:'search-only'};\nconsole.log(`);
+tools = replaceOnce(tools,'FPL dispatch case',/case 'calculate_kelly':return calculateKelly\(Number\(input\.true_probability\|\|input\.prob\|\|0\),Number\(input\.decimal_odds\|\|input\.odds\|\|0\),Number\(input\.bankroll\|\|1000\)\);/,`case 'calculate_kelly':return calculateKelly(Number(input.true_probability||input.prob||0),Number(input.decimal_odds||input.odds||0),Number(input.bankroll||1000));
+    case 'fpl_weekly_team':{const {buildFplWeeklyTeam}=await import('./fpl.js');return buildFplWeeklyTeam(input);}`);
 fs.writeFileSync(toolsTarget, tools, 'utf8');
 
 let orchestrator = fs.readFileSync(orchestratorTarget, 'utf8');
@@ -93,13 +71,19 @@ const fplRoute = `
     }
   }
 `;
-orchestrator = replaceOnce(
-  orchestrator,
-  'FPL orchestrator gate',
-  /  const parsed = await parseQuery\(userQuery\);/,
-  `${fplRoute}\n  const parsed = await parseQuery(userQuery);`
-);
+orchestrator = replaceOnce(orchestrator,'FPL orchestrator gate',/  const parsed = await parseQuery\(userQuery\);/,`${fplRoute}\n  const parsed = await parseQuery(userQuery);`);
 fs.writeFileSync(orchestratorTarget, orchestrator, 'utf8');
+
+let prompts = fs.readFileSync(promptsTarget, 'utf8');
+prompts = prompts.replace(
+  /7\. fetch_matches_today \(browser-backed legacy helper; only when runtime capability state says ENABLED\)/,
+  '7. fetch_matches_today (search APIs discover source URLs, then native fetch_url retrieves static page text; no Chromium)'
+);
+prompts = prompts.replace(
+  /- DO NOT CALL scrape, fetch_matches_today, or any browser-backed helper\./,
+  '- DO NOT CALL scrape or any browser-backed helper. fetch_matches_today IS ENABLED in search-only mode and uses search APIs followed by native fetch_url.'
+);
+fs.writeFileSync(promptsTarget, prompts, 'utf8');
 
 console.log(`[SEARCH_ONLY] Browser-backed tools disabled: ${blockedTools.join(', ')}`);
 console.log('[SEARCH_ONLY] fetch_url remains ENABLED as native HTTP/static fetch.');
