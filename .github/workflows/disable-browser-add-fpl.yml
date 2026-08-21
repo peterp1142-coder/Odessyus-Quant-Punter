@@ -1,0 +1,158 @@
+name: Search-only mode and FPL integration
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    if: ${{ !contains(github.event.head_commit.message, '[search-only-fpl]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Apply search-only runtime and FPL integration
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import re
+
+          # tools.ts: browser/scraper remain in the repo but are bypassed in search-only mode.
+          p = Path('server/agent/tools.ts')
+          s = p.read_text()
+          if "from './fpl.js'" not in s:
+              s = s.replace("import { inspectPageVisually } from './visual-browser.js';", "import { inspectPageVisually } from './visual-browser.js';\nimport { buildFplWeeklyTeam } from './fpl.js';")
+          marker = "const BROWSER_HEADERS = { 'User-Agent': DESKTOP_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };"
+          if 'const SEARCH_ONLY_MODE =' not in s:
+              s = s.replace(marker, marker + "\nconst SEARCH_ONLY_MODE = process.env.SEARCH_ONLY_MODE !== 'false';")
+
+          if 'async function searchOnlyMatchesToday' not in s:
+              anchor = "export async function fetchUrl(url:string,useMobile=false):Promise<ToolResult>"
+              helper = '''async function searchOnlyMatchesToday(sport:string,date:string):Promise<ToolResult>{
+            const day=date||new Date().toISOString().slice(0,10);
+            const queries=[
+              `${sport} fixtures ${day} today football schedule`,
+              `football fixtures ${day} all leagues today`,
+              `football matches ${day} kickoff times competition`,
+            ];
+            const results: string[]=[];
+            for(const q of queries){
+              const r=await serpSearch(q); if(r.success) results.push(r.data);
+              if(results.join('\\n').length>14000) break;
+            }
+            try{const structured=await allSportsFixtures(day);if(structured.success)results.unshift(structured.data);}catch{}
+            const data=results.filter(Boolean).join('\\n--- SEARCH SOURCE ---\\n');
+            return data?{success:true,data:truncate(data,16000),source:'search_only_fixture_discovery'}:{success:false,data:'',error:'No search-based fixtures found',source:'search_only_fixture_discovery'};
+          }
+
+          '''
+              if anchor in s:
+                  s = s.replace(anchor, helper + anchor, 1)
+
+          if 'case \'fpl_weekly_team\'' not in s:
+              dispatch_marker = "export async function dispatchTool(toolName:string,input:Record<string,unknown>):Promise<ToolResult>{\n"
+              insert = '''export async function dispatchTool(toolName:string,input:Record<string,unknown>):Promise<ToolResult>{
+            console.log(`[TOOL] ${toolName}:`,JSON.stringify(input).slice(0,180));
+            if(SEARCH_ONLY_MODE){
+              switch(toolName){
+                case 'fetch_url':
+                case 'scrape':
+                case 'book_slip':
+                  return serpSearch(fallbackQuery(String(input.url||''),input));
+                case 'fetch_matches_today':
+                  return searchOnlyMatchesToday(String(input.sport||'football'),String(input.date||''));
+                case 'scrape_flashscore':
+                  return serpSearch(`${String(input.date||'')} football fixtures Flashscore today`);
+                case 'multi_source_odds':
+                  return serpSearch(`${String(input.fixture||input.query||'')} odds bookmaker comparison today exact market`);
+                case 'fetch_fbref_stats':
+                  return serpSearch(`${String(input.team||input.fixture||'')} ${String(input.league||'')} xG advanced stats 2026/27 FBref`);
+                case 'fetch_understat_xg':
+                  return serpSearch(`${String(input.team||'')} xG expected goals 2026/27 Understat`);
+                case 'fetch_lineups':
+                  return serpSearch(`${String(input.fixture||'')} predicted lineup injuries suspensions 2026/27`);
+                case 'fpl_weekly_team':
+                  return buildFplWeeklyTeam(input);
+              }
+            }
+            switch(toolName){
+          '''
+              if dispatch_marker in s:
+                  s=s.replace(dispatch_marker,insert,1)
+                  # The original switch now has an extra switch opening. Close the inserted inner branch only where the original switch is closed.
+                  # We replace the first matching switch footer after the dispatch definition with an extra brace.
+                  old_tail = "case 'place_bet':return placeBetTool(input);\n    default:return{success:false,data:'',error:`Unknown tool: ${toolName}`};\n  }\n}"
+                  new_tail = "case 'place_bet':return placeBetTool(input);\n    case 'fpl_weekly_team':return buildFplWeeklyTeam(input);\n    default:return{success:false,data:'',error:`Unknown tool: ${toolName}`};\n  }\n}"
+                  s=s.replace(old_tail,new_tail,1)
+
+          # Prevent any browser launch while SEARCH_ONLY_MODE is enabled.
+          if 'if(SEARCH_ONLY_MODE) throw new Error' not in s:
+              s=s.replace("async function getBrowser():Promise<Browser>{\n", "async function getBrowser():Promise<Browser>{\n  if(SEARCH_ONLY_MODE) throw new Error('Browser disabled: SEARCH_ONLY_MODE is enabled');\n")
+
+          p.write_text(s)
+
+          # base.ts: prevent search result -> browser promotion in search-only mode.
+          p = Path('server/agent/subagents/base.ts')
+          b = p.read_text()
+          b = b.replace("Search only to discover another URL, then open the best source in the local browser.", "Search only; do not open webpages in the browser while SEARCH_ONLY_MODE is enabled.")
+          b = b.replace("For webpages, use the LOCAL BROWSER after source discovery.", "For webpages, use targeted search APIs and cross-check multiple search results; the local browser is disabled in this operating mode.")
+          b = b.replace("For search: serper_search first, talordata_search second", "")
+          old = "async function cachedDispatch(toolName:string,input:Record<string,unknown>,fixture:string|null){const cacheable=new Set(['serper_search','talordata_search','web_search','fetch_url','scrape','scrape_flashscore','fetch_matches_today','allsports_fixtures']);"
+          new = "async function cachedDispatch(toolName:string,input:Record<string,unknown>,fixture:string|null){if(process.env.SEARCH_ONLY_MODE!=='false') return dispatchTool(toolName,input); const cacheable=new Set(['serper_search','talordata_search','web_search','fetch_url','scrape','scrape_flashscore','fetch_matches_today','allsports_fixtures','fpl_weekly_team']);"
+          if old in b: b=b.replace(old,new,1)
+          p.write_text(b)
+
+          # prompts.ts: explicitly advertise search-only operation and FPL tool.
+          p=Path('server/agent/prompts.ts'); prm=p.read_text()
+          if 'SEARCH-ONLY OPERATING MODE' not in prm:
+              needle='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nAVAILABLE TOOLS\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+              section='''━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SEARCH-ONLY OPERATING MODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The local browser and scraper are temporarily DISABLED. Do not call scrape, book_slip, or direct webpage-reading tools expecting browser output. For web research use serper_search first, talordata_search second, web_search last; cross-check important facts across independent search results. Structured AllSports fixture data is allowed. Never treat a search snippet as confirmed if it contradicts another source.
+For Fantasy Premier League requests, use fpl_weekly_team and return a valid Gameweek squad/start XI/captain/vice/bench/transfer guidance.
+
+'''
+              prm=prm.replace(needle,section+needle,1)
+          if '15. fpl_weekly_team' not in prm:
+              prm=prm.replace('14. calculate_kelly     — {"true_probability": 0.55, "decimal_odds": 2.10, "bankroll": 1000} — Kelly Criterion', '14. calculate_kelly     — {"true_probability": 0.55, "decimal_odds": 2.10, "bankroll": 1000} — Kelly Criterion\n15. fpl_weekly_team     — {"current_squad": "optional player names/ids"} — optimize the upcoming Fantasy Premier League Gameweek squad, XI, captain, vice, bench and transfer/chip guidance',1)
+          prm=prm.replace('For fixtures/schedule: allsports_fixtures (structured JSON) THEN fetch_matches_today (scraping)', 'For fixtures/schedule: allsports_fixtures (structured JSON) THEN serper_search/talordata_search/web_search',1)
+          prm=prm.replace('For stats: fetch_fbref_stats (xG), fetch_understat_xg (xG timeline), then scrape', 'For stats: search APIs with exact team/season/source queries; cross-check independent results',1)
+          prm=prm.replace('For lineups: fetch_lineups first, then scrape sofascore', 'For lineups: search APIs for confirmed/predicted XI and verify timestamps',1)
+          prm=prm.replace('For odds: multi_source_odds first, then individual bookmaker scrapes', 'For odds: multi_source_odds resolves to search-only evidence until browser mode is re-enabled',1)
+          prm=prm.replace('SCRAPE ANTI-BOT RULES:', 'SEARCH-ONLY SOURCE RULES:',1)
+          p.write_text(prm)
+
+          # Dashboard: search-only status + FPL quick action.
+          p=Path('client/src/components/ChatInterface.tsx'); ui=p.read_text()
+          if 'Build my FPL team for this Gameweek' not in ui:
+              ui=ui.replace("const QUICK_PROMPTS=[{icon:'⚽',text:'Best value bets in Premier League today'},{icon:'🏆',text:\"Analyze Champions League tonight's fixtures\"},{icon:'📊',text:'Top 3 over/under picks this weekend'},{icon:'🎯',text:'Give me BTTS tips for today'}];", "const QUICK_PROMPTS=[{icon:'⚽',text:'Best value bets in Premier League today'},{icon:'🏆',text:\"Analyze Champions League tonight's fixtures\"},{icon:'📊',text:'Top 3 over/under picks this weekend'},{icon:'🎯',text:'Give me BTTS tips for today'},{icon:'👑',text:'Build my FPL team for this Gameweek'}];")
+          ui=ui.replace("`Ready · ${AGENTS.length}-specialist orchestration`", "`Ready · ${AGENTS.length}-specialist orchestration · search-only mode`")
+          ui=ui.replace('11-specialist fixture DAG · live Chromium research · calibration & portfolio gates', '11-specialist fixture DAG · search APIs · calibration & portfolio gates · browser paused')
+          p.write_text(ui)
+
+          # package version and explicit search-only startup flag.
+          p=Path('package.json'); pkg=json.loads(p.read_text()); pkg['version']='2.1.0'
+          pkg['scripts']['start'] = 'npm run build:server && export SEARCH_ONLY_MODE=true && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node dist-server/index.js'
+          p.write_text(json.dumps(pkg,indent=2)+"\n")
+
+      - name: TypeScript validation
+        run: |
+          npm install --no-audit --no-fund
+          npm run build:server
+
+      - name: Commit staged search-only/FPL upgrade
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/agent/tools.ts server/agent/subagents/base.ts server/agent/prompts.ts server/agent/fpl.ts client/src/components/ChatInterface.tsx package.json package-lock.json
+          git diff --cached --quiet && exit 0
+          git commit -m "[search-only-fpl] Pause browser and add weekly FPL planner"
+          git push origin main
