@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { runOrchestrator } from '../agent/orchestrator.js';
+import { buildFplWeeklyTeam } from '../agent/fpl.js';
 import type { ReActStep } from '../agent/react-engine.js';
 import { query } from '../db/index.js';
 import { getAgentPreset } from '../agent/presets.js';
@@ -14,6 +15,10 @@ function parseJson<T>(value: unknown, fallback: T): T {
   if (value == null) return fallback;
   if (typeof value === 'string') { try { return JSON.parse(value) as T; } catch { return fallback; } }
   return value as T;
+}
+
+function isFplRequest(message:string): boolean {
+  return /\b(?:fpl|fantasy premier league|fpl team|fpl squad|gameweek team|fantasy team|fpl transfers?|wildcard|free hit|bench boost|triple captain|captaincy)\b/i.test(message);
 }
 
 async function persistPrediction(sessionId:string, result:{ finalAnswer:string; steps:ReActStep[]; metadata?:Record<string,any> }) {
@@ -62,21 +67,46 @@ async function persistPrediction(sessionId:string, result:{ finalAnswer:string; 
   return predId;
 }
 
+async function saveStep(jobId:string, step:ReActStep) {
+  try {
+    const rows = await query<{steps:string|null}[]>(`SELECT steps FROM agent_jobs WHERE id=? LIMIT 1`, [jobId]);
+    const current = parseJson<ReActStep[]>(rows[0]?.steps, []);
+    await query(`UPDATE agent_jobs SET steps=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [JSON.stringify([...current, step]), jobId]);
+  } catch (err) { console.warn('[Chat] Job progress save failed:', err); }
+}
+
 async function executeJob(jobId:string, sessionId:string, effectiveMessage:string) {
   try {
     await query(`UPDATE agent_jobs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?`, [jobId]);
-    const result = await runWithVisualContext(sessionId, () => runOrchestrator(effectiveMessage, sessionId, async (step:ReActStep) => {
-      try {
-        const rows = await query<{steps:string|null}[]>(`SELECT steps FROM agent_jobs WHERE id=? LIMIT 1`, [jobId]);
-        const current = parseJson<ReActStep[]>(rows[0]?.steps, []);
-        await query(`UPDATE agent_jobs SET steps=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [JSON.stringify([...current, step]), jobId]);
-      } catch (err) { console.warn('[Chat] Job progress save failed:', err); }
-    }));
+
+    let result: { finalAnswer:string; steps:ReActStep[]; success:boolean; error?:string; metadata?:Record<string,any> };
+
+    if (isFplRequest(effectiveMessage)) {
+      const startStep:ReActStep = { type:'status', content:'⚽ FPL mode: running the dedicated player-level optimizer. Generic fixture analysis is bypassed.', timestamp:new Date().toISOString() };
+      await saveStep(jobId, startStep);
+      const fpl = await buildFplWeeklyTeam({});
+      const synthesisStep:ReActStep = { type:fpl.success?'synthesis':'error', content:fpl.success?'✅ FPL player optimization complete.':'❌ FPL player optimizer failed: ' + (fpl.error || 'unknown error'), timestamp:new Date().toISOString() };
+      await saveStep(jobId, synthesisStep);
+      let payload:Record<string,any> = {};
+      try { payload = JSON.parse(fpl.data); } catch { payload = { raw:fpl.data }; }
+      result = {
+        finalAnswer: fpl.success ? fpl.data : `FPL optimizer failed: ${fpl.error || 'unknown error'}`,
+        steps:[startStep,synthesisStep],
+        success:fpl.success,
+        error:fpl.success ? undefined : fpl.error,
+        metadata:{ mode:'FPL_DEDICATED_OPTIMIZER', gameweek:payload?.gameweek, deadline:payload?.deadline, agentsRun:['FPLWeeklyPlayerOptimizer'] }
+      };
+    } else {
+      result = await runWithVisualContext(sessionId, () => runOrchestrator(effectiveMessage, sessionId, step => saveStep(jobId, step)));
+    }
 
     let predictionId:string|undefined;
     if (result.success && result.finalAnswer) {
-      try { predictionId = await persistPrediction(sessionId, result); }
-      catch (err) { console.error('[Chat] Save prediction:', err); }
+      // FPL output is a squad recommendation, not a match prediction; do not insert it into predictions.
+      if (result.metadata?.mode !== 'FPL_DEDICATED_OPTIMIZER') {
+        try { predictionId = await persistPrediction(sessionId, result); }
+        catch (err) { console.error('[Chat] Save prediction:', err); }
+      }
       try {
         await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]);
       } catch (err) { console.error('[Chat] Save assistant msg:', err); }
