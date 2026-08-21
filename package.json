@@ -1,6 +1,6 @@
 {
   "name": "odessyus-agent",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Odessyus - Autonomous ReAct-Driven Sports Forecasting & Betting Agent",
   "type": "module",
   "scripts": {
