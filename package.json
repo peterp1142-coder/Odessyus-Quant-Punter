@@ -13,13 +13,12 @@
     "build:browser": "cd browser && npm install --no-audit --no-fund && PUPPETEER_CACHE_DIR=/opt/render/project/.chrome npx puppeteer browsers install chrome",
     "build:all": "npm run build:client && npm run build:server",
     "preview": "vite preview",
-    "start": "npm run build:server && export SEARCH_ONLY_MODE=true LOCAL_CHROME_PATH=/dev/null && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node scripts/search-only-patch.mjs && node dist-server/index.js"
+    "start": "npm run build:server && export SEARCH_ONLY_MODE=true LOCAL_CHROME_PATH=/__odessyus_browser_disabled__ && unset PUPPETEER_TOKEN SCRAPER_TOKEN && node dist-server/index.js"
   },
   "dependencies": {
     "@mistralai/mistralai": "^1.3.6",
     "@tailwindcss/postcss": "^4.3.3",
-    "@tailwindcss/vite": "^4.3.3",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@tailwindcss/vite": "^4.3.1",
     "autoprefixer": "^10.5.4",
     "cheerio": "^1.0.0",
     "compression": "^1.7.4",
