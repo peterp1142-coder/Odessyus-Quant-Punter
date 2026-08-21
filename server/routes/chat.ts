@@ -21,6 +21,15 @@ function isFplRequest(message:string): boolean {
   return /\b(?:fpl|fantasy premier league|fpl team|fpl squad|gameweek team|fantasy team|fpl transfers?|wildcard|free hit|bench boost|triple captain|captaincy)\b/i.test(message);
 }
 
+function describeError(err:unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const e = err as {code?:unknown;sqlMessage?:unknown;message?:unknown};
+    return [e.code, e.sqlMessage, e.message].filter(Boolean).join(' | ') || JSON.stringify(err);
+  }
+  return String(err);
+}
+
 async function persistPrediction(sessionId:string, result:{ finalAnswer:string; steps:ReActStep[]; metadata?:Record<string,any> }) {
   const m = result.metadata || {};
   const mc = m.monteCarlo || {};
@@ -62,7 +71,7 @@ async function persistPrediction(sessionId:string, result:{ finalAnswer:string; 
         [uuidv4(), predId, mc.home ?? null, mc.draw ?? null, mc.away ?? null, monteCarloStdDev,
           impliedProbHome, trueProb, valueEdge, m.starRating ?? null]
       );
-    } catch (fvErr) { console.error('[Chat] Save feature_vectors:', fvErr); }
+    } catch (fvErr) { console.error('[Chat] Save feature_vectors:', describeError(fvErr)); }
   }
   return predId;
 }
@@ -72,7 +81,7 @@ async function saveStep(jobId:string, step:ReActStep) {
     const rows = await query<{steps:string|null}[]>(`SELECT steps FROM agent_jobs WHERE id=? LIMIT 1`, [jobId]);
     const current = parseJson<ReActStep[]>(rows[0]?.steps, []);
     await query(`UPDATE agent_jobs SET steps=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [JSON.stringify([...current, step]), jobId]);
-  } catch (err) { console.warn('[Chat] Job progress save failed:', err); }
+  } catch (err) { console.warn('[Chat] Job progress save failed:', describeError(err)); }
 }
 
 async function executeJob(jobId:string, sessionId:string, effectiveMessage:string) {
@@ -102,22 +111,22 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
 
     let predictionId:string|undefined;
     if (result.success && result.finalAnswer) {
-      // FPL output is a squad recommendation, not a match prediction; do not insert it into predictions.
       if (result.metadata?.mode !== 'FPL_DEDICATED_OPTIMIZER') {
         try { predictionId = await persistPrediction(sessionId, result); }
-        catch (err) { console.error('[Chat] Save prediction:', err); }
+        catch (err) { console.error('[Chat] Save prediction:', describeError(err)); }
       }
       try {
         await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]);
-      } catch (err) { console.error('[Chat] Save assistant msg:', err); }
+      } catch (err) { console.error('[Chat] Save assistant msg:', describeError(err)); }
     }
 
     const metadata = { ...(result.metadata || {}), ...(predictionId ? { predictionId } : {}) };
     await query(`UPDATE agent_jobs SET status=?, final_answer=?, result_metadata=?, error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
       [result.success ? 'completed' : 'failed', result.finalAnswer || null, JSON.stringify(metadata), result.error || null, jobId]);
   } catch (err) {
-    console.error('[Chat] Background orchestrator error:', err);
-    await query(`UPDATE agent_jobs SET status='failed', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [err instanceof Error ? err.message : String(err), jobId]).catch(()=>{});
+    const message = describeError(err);
+    console.error('[Chat] Background orchestrator error:', message);
+    await query(`UPDATE agent_jobs SET status='failed', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [message, jobId]).catch(dbErr=>console.error('[Chat] Failed to mark job failed:', describeError(dbErr)));
   }
 }
 
@@ -128,6 +137,7 @@ router.post('/', async (req:Request,res:Response) => {
   if (preset && !internalPreset) return res.status(400).json({error:'Unknown agent preset'});
   const sessionId = existing || uuidv4();
 
+  console.log(`[Chat] Queue request session=${sessionId} preset=${preset || 'none'} message=${message?.trim() ? 'present' : 'none'}`);
   try {
     const active = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
     if (active.length) return res.json({sessionId, jobId:active[0].id, status:active[0].status, resumed:true});
@@ -138,10 +148,12 @@ router.post('/', async (req:Request,res:Response) => {
     const jobId = uuidv4();
     await query(`INSERT INTO agent_jobs (id, session_id, message, preset, status, steps) VALUES (?, ?, ?, ?, 'queued', ?)`, [jobId, sessionId, message?.trim() || null, preset || null, JSON.stringify([])]);
     void executeJob(jobId, sessionId, internalPreset || message!.trim());
+    console.log(`[Chat] Queued agent job ${jobId} session=${sessionId}`);
     res.json({sessionId, jobId, status:'queued'});
   } catch (err) {
-    console.error('[Chat] Queue job:', err);
-    res.status(500).json({error:'Failed to start agent job'});
+    const messageText = describeError(err);
+    console.error('[Chat] Queue job failed:', messageText);
+    res.status(500).json({error:`Failed to start agent job: ${messageText}`});
   }
 });
 
@@ -157,8 +169,8 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
     }
   } catch { return res.status(500).json({error:'Failed to load agent job'}); }
   if (!jobRows.length) return res.status(404).json({error:'No agent job found for session'});
-  const job = jobRows[0];
 
+  const job = jobRows[0];
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
