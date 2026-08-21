@@ -18,7 +18,8 @@ function parseJson<T>(value: unknown, fallback: T): T {
 }
 
 function isFplRequest(message:string): boolean {
-  return /\b(?:fpl|fantasy premier league|fpl team|fpl squad|gameweek team|fantasy team|fpl transfers?|wildcard|free hit|bench boost|triple captain|captaincy)\b/i.test(message);
+  const normalized = message.trim().toLowerCase();
+  return /\b(?:fpl|fantasy premier league|fpl team|fpl squad|gameweek team|fantasy team|fpl transfers?|wildcard|free hit|bench boost|triple captain|captaincy)\b/i.test(normalized);
 }
 
 function describeError(err:unknown): string {
@@ -85,24 +86,30 @@ async function saveStep(jobId:string, step:ReActStep) {
 }
 
 async function executeJob(jobId:string, sessionId:string, effectiveMessage:string) {
+  const fpl = isFplRequest(effectiveMessage);
+  console.log(`[Chat] Starting job ${jobId} mode=${fpl ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'} message=${effectiveMessage.slice(0,180)}`);
   try {
     await query(`UPDATE agent_jobs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?`, [jobId]);
+    console.log(`[Chat] Job ${jobId} marked running mode=${fpl ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'}`);
 
     let result: { finalAnswer:string; steps:ReActStep[]; success:boolean; error?:string; metadata?:Record<string,any> };
 
-    if (isFplRequest(effectiveMessage)) {
+    if (fpl) {
+      console.log(`[FPL] Starting dedicated player optimizer job=${jobId}`);
       const startStep:ReActStep = { type:'status', content:'⚽ FPL mode: running the dedicated player-level optimizer. Generic fixture analysis is bypassed.', timestamp:new Date().toISOString() };
       await saveStep(jobId, startStep);
-      const fpl = await buildFplWeeklyTeam({});
-      const synthesisStep:ReActStep = { type:fpl.success?'synthesis':'error', content:fpl.success?'✅ FPL player optimization complete.':'❌ FPL player optimizer failed: ' + (fpl.error || 'unknown error'), timestamp:new Date().toISOString() };
+      console.log(`[FPL] Fetching official FPL player/fixture data job=${jobId}`);
+      const fplResult = await buildFplWeeklyTeam({});
+      console.log(`[FPL] Optimizer finished job=${jobId} success=${fplResult.success}`);
+      const synthesisStep:ReActStep = { type:fplResult.success?'synthesis':'error', content:fplResult.success?'✅ FPL player optimization complete.':'❌ FPL player optimizer failed: ' + (fplResult.error || 'unknown error'), timestamp:new Date().toISOString() };
       await saveStep(jobId, synthesisStep);
       let payload:Record<string,any> = {};
-      try { payload = JSON.parse(fpl.data); } catch { payload = { raw:fpl.data }; }
+      try { payload = JSON.parse(fplResult.data); } catch { payload = { raw:fplResult.data }; }
       result = {
-        finalAnswer: fpl.success ? fpl.data : `FPL optimizer failed: ${fpl.error || 'unknown error'}`,
+        finalAnswer: fplResult.success ? fplResult.data : `FPL optimizer failed: ${fplResult.error || 'unknown error'}`,
         steps:[startStep,synthesisStep],
-        success:fpl.success,
-        error:fpl.success ? undefined : fpl.error,
+        success:fplResult.success,
+        error:fplResult.success ? undefined : fplResult.error,
         metadata:{ mode:'FPL_DEDICATED_OPTIMIZER', gameweek:payload?.gameweek, deadline:payload?.deadline, agentsRun:['FPLWeeklyPlayerOptimizer'] }
       };
     } else {
@@ -123,9 +130,10 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
     const metadata = { ...(result.metadata || {}), ...(predictionId ? { predictionId } : {}) };
     await query(`UPDATE agent_jobs SET status=?, final_answer=?, result_metadata=?, error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
       [result.success ? 'completed' : 'failed', result.finalAnswer || null, JSON.stringify(metadata), result.error || null, jobId]);
+    console.log(`[Chat] Job ${jobId} completed status=${result.success ? 'completed' : 'failed'} mode=${fpl ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'}`);
   } catch (err) {
     const message = describeError(err);
-    console.error('[Chat] Background orchestrator error:', message);
+    console.error(`[Chat] Job ${jobId} failed:`, message);
     await query(`UPDATE agent_jobs SET status='failed', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, [message, jobId]).catch(dbErr=>console.error('[Chat] Failed to mark job failed:', describeError(dbErr)));
   }
 }
@@ -138,6 +146,7 @@ router.post('/', async (req:Request,res:Response) => {
   const sessionId = existing || uuidv4();
 
   console.log(`[Chat] Queue request session=${sessionId} preset=${preset || 'none'} message=${message?.trim() ? 'present' : 'none'}`);
+
   try {
     const active = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
     if (active.length) return res.json({sessionId, jobId:active[0].id, status:active[0].status, resumed:true});
@@ -146,14 +155,19 @@ router.post('/', async (req:Request,res:Response) => {
       await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'user', message.trim()]);
     }
     const jobId = uuidv4();
+    const effectiveMessage = (internalPreset || message || '').trim();
     await query(`INSERT INTO agent_jobs (id, session_id, message, preset, status, steps) VALUES (?, ?, ?, ?, 'queued', ?)`, [jobId, sessionId, message?.trim() || null, preset || null, JSON.stringify([])]);
-    void executeJob(jobId, sessionId, internalPreset || message!.trim());
-    console.log(`[Chat] Queued agent job ${jobId} session=${sessionId}`);
+    console.log(`[Chat] Queued agent job ${jobId} session=${sessionId} mode=${isFplRequest(effectiveMessage) ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'}`);
+
+    // Explicitly detach the worker with an error handler; do not rely on an unobserved void promise.
+    void executeJob(jobId, sessionId, effectiveMessage).catch(err => {
+      console.error(`[Chat] Detached job worker crashed ${jobId}:`, describeError(err));
+    });
+
     res.json({sessionId, jobId, status:'queued'});
   } catch (err) {
-    const messageText = describeError(err);
-    console.error('[Chat] Queue job failed:', messageText);
-    res.status(500).json({error:`Failed to start agent job: ${messageText}`});
+    console.error('[Chat] Queue job:', describeError(err));
+    res.status(500).json({error:`Failed to start agent job: ${describeError(err)}`});
   }
 });
 
@@ -169,8 +183,8 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
     }
   } catch { return res.status(500).json({error:'Failed to load agent job'}); }
   if (!jobRows.length) return res.status(404).json({error:'No agent job found for session'});
-
   const job = jobRows[0];
+
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
