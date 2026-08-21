@@ -9,23 +9,37 @@ for (const target of [toolsTarget, orchestratorTarget, promptsTarget]) {
 }
 
 function replaceOnce(source, label, pattern, replacement) {
-  if (!pattern.test(source)) throw new Error(`Patch target not found: ${label}`);
+  if (!pattern.test(source)) throw new Error(`SEARCH_ONLY patch target not found: ${label}`);
   return source.replace(pattern, replacement);
 }
 
 const searchOnly = "process.env.SEARCH_ONLY_MODE === 'true'";
 
 let tools = fs.readFileSync(toolsTarget, 'utf8');
-tools = replaceOnce(tools,'getBrowser guard',/async function getBrowser\(\)\{/,`async function getBrowser(){if(${searchOnly})throw new Error('Browser disabled by SEARCH_ONLY_MODE');`);
-tools = replaceOnce(tools,'scrape guard',/export async function scrape\(url,selector,waitTime=7000\)\{/,`export async function scrape(url,selector,waitTime=7000){if(${searchOnly})return{success:false,data:'',error:'scrape disabled by SEARCH_ONLY_MODE',blocked:true,source:'scrape:search-only'};`);
 
 tools = replaceOnce(
   tools,
+  'getBrowser guard',
+  /async\s+function\s+getBrowser\s*\(\s*\)\s*\{/,
+  `async function getBrowser(){if(${searchOnly})throw new Error('Browser disabled by SEARCH_ONLY_MODE');`
+);
+
+tools = replaceOnce(
+  tools,
+  'scrape guard',
+  /export\s+async\s+function\s+scrape\s*\(\s*url\s*,\s*selector\s*,\s*waitTime\s*=\s*7000\s*\)\s*\{/,
+  `export async function scrape(url,selector,waitTime=7000){if(${searchOnly})return{success:false,data:'',error:'scrape disabled by SEARCH_ONLY_MODE',blocked:true,source:'scrape:search-only'};`
+);
+
+// fetch_matches_today is intentionally native-fetch based in SEARCH_ONLY_MODE:
+// search APIs discover candidate source URLs, then Node fetchUrl retrieves page text.
+tools = replaceOnce(
+  tools,
   'fetchMatchesToday implementation',
-  /export async function fetchMatchesToday\(sport='football',dateStr\?\)\{[\s\S]*?\nexport async function multiSourceOdds/,
+  /export\s+async\s+function\s+fetchMatchesToday\s*\(\s*sport\s*=\s*'football'\s*,\s*dateStr\?\s*\)\s*\{[\s\S]*?\nexport\s+async\s+function\s+multiSourceOdds/,
   `export async function fetchMatchesToday(sport='football',dateStr?:string){
   const today=dateStr||new Date().toISOString().slice(0,10);
-  const queries=[\`\${sport} fixtures \${today} schedule results\`,\`\${sport} matches today \${today} kickoff fixtures\`];
+  const queries=[\`${'${'}sport} fixtures ${'${'}today} schedule results\`,\`${'${'}sport} matches today ${'${'}today} kickoff fixtures\`];
   const searchResults=await Promise.allSettled(queries.map(q=>serpSearch(q)));
   const sources:string[]=[];
   for(const r of searchResults){if(r.status==='fulfilled'&&r.value.success&&r.value.data)sources.push(r.value.data);}
@@ -35,9 +49,9 @@ tools = replaceOnce(
   for(const source of sources){for(const rawUrl of source.match(urlPattern)||[]){const url=rawUrl.replace(/[.,;]+$/,'');if(!urls.includes(url))urls.push(url);if(urls.length>=12)break;}if(urls.length>=12)break;}
   const pageResults=await Promise.allSettled(urls.map(url=>fetchUrl(url)));
   const pages:string[]=[];
-  for(let i=0;i<pageResults.length;i++){const r=pageResults[i];if(r.status==='fulfilled'&&r.value.success&&!r.value.blocked)pages.push(\`=== SOURCE \${urls[i]} ===\\n\${r.value.data.slice(0,5000)}\`);}
-  const combined=[...sources.map((s,i)=>\`=== SEARCH \${i+1} ===\\n\${s.slice(0,5000)}\`),...pages].join('\\n\\n').slice(0,24000);
-  return combined?{success:true,data:\`[Date: \${today}] [Sport: \${sport}]\\n\${combined}\`,source:'fetch_matches_today:search+fetch_url'}:{success:false,data:'',error:'Discovered fixture URLs could not be fetched',source:'fetch_matches_today:search+fetch_url'};
+  for(let i=0;i<pageResults.length;i++){const r=pageResults[i];if(r.status==='fulfilled'&&r.value.success&&!r.value.blocked)pages.push(\`=== SOURCE ${'${'}urls[i]} ===\\n${'${'}r.value.data.slice(0,5000)}\`);}
+  const combined=[...sources.map((s,i)=>\`=== SEARCH ${'${'}i+1} ===\\n${'${'}s.slice(0,5000)}\`),...pages].join('\\n\\n').slice(0,24000);
+  return combined?{success:true,data:\`[Date: ${'${'}today}] [Sport: ${'${'}sport}]\\n${'${'}combined}\`,source:'fetch_matches_today:search+fetch_url'}:{success:false,data:'',error:'Discovered fixture URLs could not be fetched',source:'fetch_matches_today:search+fetch_url'};
 }
 
 export async function multiSourceOdds`
@@ -45,9 +59,20 @@ export async function multiSourceOdds`
 
 const blockedTools = ['scrape','book_slip','scrape_flashscore','multi_source_odds','fetch_fbref_stats','fetch_understat_xg','fetch_lineups'];
 const names = blockedTools.map(name => `'${name}'`).join(',');
-tools = replaceOnce(tools,'dispatch guard',/export async function dispatchTool\(toolName,input\)\{\n\s*console\.log\(/,`export async function dispatchTool(toolName,input){if(${searchOnly}&&[${names}].includes(toolName))return{success:false,data:'',error:\`Tool disabled in SEARCH_ONLY_MODE: \${toolName}\`,blocked:true,source:'search-only'};\nconsole.log(`);
-tools = replaceOnce(tools,'FPL dispatch case',/case 'calculate_kelly':return calculateKelly\(Number\(input\.true_probability\|\|input\.prob\|\|0\),Number\(input\.decimal_odds\|\|input\.odds\|\|0\),Number\(input\.bankroll\|\|1000\)\);/,`case 'calculate_kelly':return calculateKelly(Number(input.true_probability||input.prob||0),Number(input.decimal_odds||input.odds||0),Number(input.bankroll||1000));
-    case 'fpl_weekly_team':{const {buildFplWeeklyTeam}=await import('./fpl.js');return buildFplWeeklyTeam(input);}`);
+tools = replaceOnce(
+  tools,
+  'dispatch guard',
+  /export\s+async\s+function\s+dispatchTool\s*\(\s*toolName\s*,\s*input\s*\)\s*\{\s*console\.log\(/,
+  `export async function dispatchTool(toolName,input){if(${searchOnly}&&[${names}].includes(toolName))return{success:false,data:'',error:\`Tool disabled in SEARCH_ONLY_MODE: ${'${'}toolName}\`,blocked:true,source:'search-only'};\nconsole.log(`
+);
+
+tools = replaceOnce(
+  tools,
+  'FPL dispatch case',
+  /case\s+'calculate_kelly'\s*:\s*return\s+calculateKelly\(\s*Number\(input\.true_probability\|\|input\.prob\|\|0\)\s*,\s*Number\(input\.decimal_odds\|\|input\.odds\|\|0\)\s*,\s*Number\(input\.bankroll\|\|1000\)\s*\)\s*;/,
+  `case 'calculate_kelly':return calculateKelly(Number(input.true_probability||input.prob||0),Number(input.decimal_odds||input.odds||0),Number(input.bankroll||1000));
+    case 'fpl_weekly_team':{const {buildFplWeeklyTeam}=await import('./fpl.js');return buildFplWeeklyTeam(input);}`
+);
 fs.writeFileSync(toolsTarget, tools, 'utf8');
 
 let orchestrator = fs.readFileSync(orchestratorTarget, 'utf8');
@@ -59,7 +84,7 @@ const fplRoute = `
       const { buildFplWeeklyTeam } = await import('./fpl.js');
       const fplResult = await buildFplWeeklyTeam({});
       if (!fplResult.success) {
-        return { finalAnswer: \`FPL optimizer failed: \${fplResult.error || 'unknown error'}\`, steps, success: false, error: fplResult.error, metadata: { mode: 'FPL_DEDICATED_OPTIMIZER' } };
+        return { finalAnswer: \`FPL optimizer failed: ${'${'}fplResult.error || 'unknown error'}\`, steps, success: false, error: fplResult.error, metadata: { mode: 'FPL_DEDICATED_OPTIMIZER' } };
       }
       let payload = {};
       try { payload = JSON.parse(fplResult.data); } catch {}
@@ -67,11 +92,16 @@ const fplRoute = `
       return { finalAnswer: fplResult.data, steps, success: true, metadata: { mode: 'FPL_DEDICATED_OPTIMIZER', gameweek: payload.gameweek, deadline: payload.deadline, agentsRun: ['FPLWeeklyPlayerOptimizer'] } };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return { finalAnswer: \`FPL optimizer failed: \${msg}\`, steps, success: false, error: msg, metadata: { mode: 'FPL_DEDICATED_OPTIMIZER' } };
+      return { finalAnswer: \`FPL optimizer failed: ${'${'}msg}\`, steps, success: false, error: msg, metadata: { mode: 'FPL_DEDICATED_OPTIMIZER' } };
     }
   }
 `;
-orchestrator = replaceOnce(orchestrator,'FPL orchestrator gate',/  const parsed = await parseQuery\(userQuery\);/,`${fplRoute}\n  const parsed = await parseQuery(userQuery);`);
+orchestrator = replaceOnce(
+  orchestrator,
+  'FPL orchestrator gate',
+  /\bconst\s+parsed\s*=\s*await\s+parseQuery\(userQuery\)\s*;/,
+  `${fplRoute}\n  const parsed = await parseQuery(userQuery);`
+);
 fs.writeFileSync(orchestratorTarget, orchestrator, 'utf8');
 
 let prompts = fs.readFileSync(promptsTarget, 'utf8');
