@@ -20,7 +20,7 @@ let tools = fs.readFileSync(toolsTarget, 'utf8');
 tools = replaceOnce(
   tools,
   'getBrowser guard',
-  /async\s+function\s+getBrowser\s*\(\s*\)\s*\{/,
+  /async\s+function\s+getBrowser\s*\(\s*\)\s*\{/, 
   `async function getBrowser(){if(${searchOnly})throw new Error('Browser disabled by SEARCH_ONLY_MODE');`
 );
 
@@ -36,7 +36,7 @@ tools = replaceOnce(
 tools = replaceOnce(
   tools,
   'fetchMatchesToday implementation',
-  /export\s+async\s+function\s+fetchMatchesToday\s*\(\s*sport\s*=\s*'football'\s*,\s*dateStr\?\s*\)\s*\{[\s\S]*?\nexport\s+async\s+function\s+multiSourceOdds/,
+  /export\s+async\s+function\s+fetchMatchesToday\s*\([^)]*\)\s*\{[\s\S]*?\nexport\s+async\s+function\s+multiSourceOdds/,
   `export async function fetchMatchesToday(sport='football',dateStr?:string){
   const today=dateStr||new Date().toISOString().slice(0,10);
   const queries=[\`${'${'}sport} fixtures ${'${'}today} schedule results\`,\`${'${'}sport} matches today ${'${'}today} kickoff fixtures\`];
