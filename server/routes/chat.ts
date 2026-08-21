@@ -31,6 +31,67 @@ function describeError(err:unknown): string {
   return String(err);
 }
 
+function fplPlayerLabel(value: unknown): string {
+  const p = value as Record<string, any> | undefined;
+  if (!p || typeof p !== 'object') return String(value ?? '');
+  return `${p.player ?? p.name ?? ''} (${p.position ?? p.element_type ?? ''}, ${p.club ?? p.team ?? ''})`;
+}
+
+function formatFplMarkdown(payload: Record<string, any>): string {
+  const squad = Array.isArray(payload.squad) ? payload.squad : [];
+  const xi = Array.isArray(payload.starting_xi) ? payload.starting_xi : [];
+  const bench = Array.isArray(payload.bench) ? payload.bench : [];
+  const signals = Array.isArray(payload.top_manager_role_signals) ? payload.top_manager_role_signals : [];
+  const captain = payload.captain ?? '—';
+  const vice = payload.vice_captain ?? '—';
+  const gameweek = payload.gameweek ?? '—';
+  const deadline = payload.deadline ? new Date(payload.deadline).toLocaleString() : '—';
+  const budget = payload.budget_remaining ?? '—';
+  const score = payload.optimization_score ?? '—';
+  const formation = payload.formation ?? '—';
+
+  const normalizePlayer = (value: unknown): string[] => {
+    if (typeof value === 'string') {
+      const match = value.match(/^(.*?)\s+\((.*?),\s*(.*?)\)\s+£([\d.]+)\s+\|\s+GW score\s+([\d.]+)\s+\|\s+6GW\s+([\d.]+)\s+\|\s+FDR\s+([\d.]+)\s+\|\s+fixtures\s+(\d+)(?:\s+\|\s+role\s+([\d.]+)\s+\|\s+mins risk\s+([\d.]+))?$/);
+      if (match) return [match[1], match[2], match[3], match[4], match[5], match[6], match[7], match[8], match[9] ?? '', match[10] ?? ''];
+      return [value, '', '', '', '', '', '', '', '', ''];
+    }
+    const p = value as Record<string, any>;
+    return [String(p.player ?? p.name ?? '—'), String(p.position ?? '—'), String(p.club ?? p.team ?? '—'), String(p.price ?? p.cost ?? '—'), String(p.gw_score ?? p.score ?? '—'), String(p.six_gw ?? p.projected6 ?? '—'), String(p.fdr ?? p.fixtureAvg ?? '—'), String(p.fixtures ?? p.fixtureCount ?? '—'), String(p.role_security ?? p.roleSecurity ?? ''), String(p.minutes_risk ?? p.minutesRisk ?? '')];
+  };
+
+  const playerTable = (players: unknown[]) => {
+    if (!players.length) return '_None_';
+    const rows = players.map(normalizePlayer).map((r, i) => `| ${i + 1} | ${r[0]} | ${r[1]} | ${r[2]} | £${r[3]} | ${r[4]} | ${r[5]} | ${r[6]} | ${r[7]} | ${r[8] ? `${r[8]} / ${r[9]}` : '—'} |`).join('\n');
+    return `| # | Player | Pos | Club | Price | GW | 6GW | FDR | Fixtures | Role / Min-risk |\n|---:|---|:---:|---|---:|---:|---:|---:|---:|---|\n${rows}`;
+  };
+
+  const signalRows = signals.slice(0, 12).map((s: any) => `| ${s.player ?? '—'} | ${s.club ?? '—'} | ${s.sentiment ?? '—'} | ${Number(s.role_security ?? 0).toFixed(2)} | ${Number(s.minutes_risk ?? 0).toFixed(2)} | ${Number(s.tactical_upside ?? 0).toFixed(2)} | ${s.freshness_days ?? '—'}d |`).join('\n');
+
+  return [
+    `## ⚽ FPL Gameweek ${gameweek} Squad`,
+    '',
+    `**Deadline:** ${deadline}  \n**Formation:** ${formation}  \n**Budget remaining:** ${budget}  \n**Optimization score:** ${score}`,
+    '',
+    `### Starting XI`,
+    playerTable(xi),
+    '',
+    `**Captain:** ${fplPlayerLabel(captain)}  \n**Vice-captain:** ${fplPlayerLabel(vice)}`,
+    '',
+    `### Bench`,
+    playerTable(bench),
+    '',
+    `### Full 15-man Squad`,
+    playerTable(squad),
+    '',
+    `### Manager / Role Intelligence`,
+    signalRows ? `| Player | Club | Sentiment | Role security | Minutes risk | Tactical upside | Freshness |\n|---|---|---|---:|---:|---:|---:|\n${signalRows}` : '_No significant manager signals were flagged._',
+    '',
+    `### Transfer Guidance`,
+    String(payload.transfer_guidance ?? '—'),
+  ].join('\n');
+}
+
 async function persistPrediction(sessionId:string, result:{ finalAnswer:string; steps:ReActStep[]; metadata?:Record<string,any> }) {
   const m = result.metadata || {};
   const mc = m.monteCarlo || {};
@@ -99,18 +160,18 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
       const startStep:ReActStep = { type:'status', content:'⚽ FPL mode: running the dedicated player-level optimizer. Generic fixture analysis is bypassed.', timestamp:new Date().toISOString() };
       await saveStep(jobId, startStep);
       console.log(`[FPL] Fetching official FPL player/fixture data job=${jobId}`);
-      const fplResult = await buildFplWeeklyTeam({});
+      const fplResult = await buildFplWeeklyTeam({__job_id:jobId});
       console.log(`[FPL] Optimizer finished job=${jobId} success=${fplResult.success}`);
       const synthesisStep:ReActStep = { type:fplResult.success?'synthesis':'error', content:fplResult.success?'✅ FPL player optimization complete.':'❌ FPL player optimizer failed: ' + (fplResult.error || 'unknown error'), timestamp:new Date().toISOString() };
       await saveStep(jobId, synthesisStep);
       let payload:Record<string,any> = {};
       try { payload = JSON.parse(fplResult.data); } catch { payload = { raw:fplResult.data }; }
       result = {
-        finalAnswer: fplResult.success ? fplResult.data : `FPL optimizer failed: ${fplResult.error || 'unknown error'}`,
+        finalAnswer: fplResult.success ? formatFplMarkdown(payload) : `FPL optimizer failed: ${fplResult.error || 'unknown error'}`,
         steps:[startStep,synthesisStep],
         success:fplResult.success,
         error:fplResult.success ? undefined : fplResult.error,
-        metadata:{ mode:'FPL_DEDICATED_OPTIMIZER', gameweek:payload?.gameweek, deadline:payload?.deadline, agentsRun:['FPLWeeklyPlayerOptimizer'] }
+        metadata:{ mode:'FPL_DEDICATED_OPTIMIZER', fpl:payload, gameweek:payload?.gameweek, deadline:payload?.deadline, agentsRun:['FPLWeeklyPlayerOptimizer'] }
       };
     } else {
       result = await runWithVisualContext(sessionId, () => runOrchestrator(effectiveMessage, sessionId, step => saveStep(jobId, step)));
@@ -122,9 +183,8 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
         try { predictionId = await persistPrediction(sessionId, result); }
         catch (err) { console.error('[Chat] Save prediction:', describeError(err)); }
       }
-      try {
-        await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]);
-      } catch (err) { console.error('[Chat] Save assistant msg:', describeError(err)); }
+      try { await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]); }
+      catch (err) { console.error('[Chat] Save assistant msg:', describeError(err)); }
     }
 
     const metadata = { ...(result.metadata || {}), ...(predictionId ? { predictionId } : {}) };
@@ -144,26 +204,16 @@ router.post('/', async (req:Request,res:Response) => {
   if (!message?.trim() && !internalPreset) return res.status(400).json({error:'Message is required'});
   if (preset && !internalPreset) return res.status(400).json({error:'Unknown agent preset'});
   const sessionId = existing || uuidv4();
-
   console.log(`[Chat] Queue request session=${sessionId} preset=${preset || 'none'} message=${message?.trim() ? 'present' : 'none'}`);
-
   try {
     const active = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
     if (active.length) return res.json({sessionId, jobId:active[0].id, status:active[0].status, resumed:true});
-
-    if (message?.trim() && !internalPreset) {
-      await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'user', message.trim()]);
-    }
+    if (message?.trim() && !internalPreset) await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'user', message.trim()]);
     const jobId = uuidv4();
     const effectiveMessage = (internalPreset || message || '').trim();
     await query(`INSERT INTO agent_jobs (id, session_id, message, preset, status, steps) VALUES (?, ?, ?, ?, 'queued', ?)`, [jobId, sessionId, message?.trim() || null, preset || null, JSON.stringify([])]);
     console.log(`[Chat] Queued agent job ${jobId} session=${sessionId} mode=${isFplRequest(effectiveMessage) ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'}`);
-
-    // Explicitly detach the worker with an error handler; do not rely on an unobserved void promise.
-    void executeJob(jobId, sessionId, effectiveMessage).catch(err => {
-      console.error(`[Chat] Detached job worker crashed ${jobId}:`, describeError(err));
-    });
-
+    void executeJob(jobId, sessionId, effectiveMessage).catch(err => console.error(`[Chat] Detached job worker crashed ${jobId}:`, describeError(err)));
     res.json({sessionId, jobId, status:'queued'});
   } catch (err) {
     console.error('[Chat] Queue job:', describeError(err));
@@ -176,15 +226,11 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   const {message, preset} = req.query as {message?:string;preset?:string};
   let jobRows:JobRow[] = [];
   try {
-    if (message?.trim() || preset) {
-      jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
-    } else {
-      jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1`, [sessionId]);
-    }
+    if (message?.trim() || preset) jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+    else jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1`, [sessionId]);
   } catch { return res.status(500).json({error:'Failed to load agent job'}); }
   if (!jobRows.length) return res.status(404).json({error:'No agent job found for session'});
   const job = jobRows[0];
-
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
@@ -194,9 +240,7 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   const heartbeat = setInterval(()=>{if(!res.writableEnded)res.write(': heartbeat\n\n');},15000);
   let sentSteps = 0;
   let connected = false;
-
   sse('connected',{sessionId,jobId:job.id,engine:'orchestrator-v2-background',preset:job.preset || undefined,resumed:!message && !preset});
-
   const tick = async () => {
     try {
       const rows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE id=? LIMIT 1`, [job.id]);
@@ -216,7 +260,6 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
     } catch { if (!connected) sse('error',{message:'Agent stream error'}); }
     return false;
   };
-
   await tick();
   const timer = setInterval(async()=>{ if (res.writableEnded) return; const done=await tick(); if(done){clearInterval(timer);clearInterval(heartbeat);res.end();} },1000);
   req.on('close',()=>{ clearInterval(timer); clearInterval(heartbeat); });
