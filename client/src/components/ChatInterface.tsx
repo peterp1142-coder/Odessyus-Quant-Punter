@@ -18,10 +18,54 @@ const AGENTS=[
  {icon:'🧩',name:'PortfolioRiskScout',desc:'Correlation & accumulator concentration'},
 ];
 interface ChatInterfaceProps{conversationId:string;initialMessages:ChatMessage[];onMessagesChange:(messages:ChatMessage[])=>void;onNewChat:()=>void;}
+
+function makeId(prefix:string){ return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
+
 export const ChatInterface:React.FC<ChatInterfaceProps>=({conversationId,initialMessages,onMessagesChange,onNewChat})=>{
  const{messages,isStreaming,liveBrowserVisual,verification,verificationAction,resumeVerification,sendMessage,runPreset,cancelRequest}=useChat({conversationId,initialMessages,onMessagesChange});
- const[input,setInput]=useState('');const[verificationError,setVerificationError]=useState('');const inputRef=useRef<HTMLTextAreaElement>(null);const messagesEndRef=useRef<HTMLDivElement>(null);
+ const[input,setInput]=useState('');const[verificationError,setVerificationError]=useState('');const[retrieveAvailable,setRetrieveAvailable]=useState(false);const[retrieving,setRetrieving]=useState(false);const inputRef=useRef<HTMLTextAreaElement>(null);const messagesEndRef=useRef<HTMLDivElement>(null);
  useEffect(()=>{messagesEndRef.current?.scrollIntoView({behavior:'smooth'});},[messages.length,isStreaming]);
+ useEffect(()=>{
+   let cancelled=false;
+   fetch(`/api/chat/retrieve-fpl/${encodeURIComponent(conversationId)}`)
+     .then(r=>r.ok?r.json():{available:false})
+     .then((d:{available?:boolean})=>{if(!cancelled)setRetrieveAvailable(Boolean(d.available));})
+     .catch(()=>{if(!cancelled)setRetrieveAvailable(false);});
+   return()=>{cancelled=true;};
+ },[conversationId]);
+ const handleRetrieveFpl=async()=>{
+   if(retrieving||isStreaming)return;
+   setRetrieving(true);
+   try{
+     const res=await fetch(`/api/chat/retrieve-fpl/${encodeURIComponent(conversationId)}`);
+     const data=await res.json() as {available?:boolean;jobId?:string;finalAnswer?:string;metadata?:Record<string,unknown>;error?:string};
+     if(!res.ok||!data.available||!data.finalAnswer) throw new Error(data.error||'No saved FPL result is available for this session.');
+     const existingSaved=messages.some(m=>m.role==='assistant' && m.content===data.finalAnswer);
+     if(!existingSaved){
+       const restored:ChatMessage={
+         id:makeId('fpl-retrieved'),
+         role:'assistant',
+         content:data.finalAnswer,
+         timestamp:new Date().toISOString(),
+         isStreaming:false,
+         metadata:data.metadata,
+         steps:[],
+       } as ChatMessage;
+       onMessagesChange([...messages,restored]);
+     }
+     setRetrieveAvailable(false);
+   }catch(err){
+     const restored:ChatMessage={
+       id:makeId('fpl-retrieve-error'),
+       role:'assistant',
+       content:`⚠️ Could not retrieve the saved FPL result: ${err instanceof Error?err.message:String(err)}`,
+       timestamp:new Date().toISOString(),
+       isStreaming:false,
+       steps:[],
+     } as ChatMessage;
+     onMessagesChange([...messages,restored]);
+   }finally{setRetrieving(false);}
+ };
  const handleSubmit=(e?:React.FormEvent)=>{e?.preventDefault();if(!input.trim()||isStreaming)return;sendMessage(input.trim());setInput('');};
  const handleKeyDown=(e:React.KeyboardEvent<HTMLTextAreaElement>)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();handleSubmit();}};
  const runAccumulator=()=>{if(!isStreaming)runPreset('statistically_plausible_accumulator');};
@@ -32,7 +76,13 @@ export const ChatInterface:React.FC<ChatInterfaceProps>=({conversationId,initial
  const fixtureCount=Array.isArray(lastMeta?.fixtures)?lastMeta.fixtures.length:0;
  const runVerificationAction=async(action:Parameters<typeof verificationAction>[0])=>{setVerificationError('');try{await verificationAction(action);}catch(err){setVerificationError(err instanceof Error?err.message:'Verification action failed');}};
  return <div className="flex flex-col h-full bg-[#0d0d0d]">
-  <div className="flex items-center justify-between px-6 py-3 border-b border-white/[0.06] flex-shrink-0"><div className="flex items-center gap-2.5"><div className="relative"><div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-sm font-bold text-white shadow-lg shadow-emerald-900/30">⚡</div><span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0d0d0d] ${isStreaming?'bg-amber-400 animate-pulse':'bg-emerald-400'}`}/></div><div><div className="text-sm font-semibold text-white">Odessyus Agent</div><div className="text-xs text-neutral-500 font-mono">{verificationRequired?<span className="text-amber-400/90">Human verification required</span>:isStreaming?<span className="text-amber-400/80 flex items-center gap-1.5"><span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"/>Analyzing · fixture DAG active…</span>:`Ready · ${AGENTS.length}-specialist orchestration · search-only mode`}</div></div></div><button onClick={onNewChat} disabled={verificationRequired} className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-200 disabled:opacity-40 transition-colors px-3 py-1.5 rounded-lg hover:bg-white/[0.06] border border-transparent hover:border-white/[0.06]">New chat</button></div>
+  <div className="flex items-center justify-between px-6 py-3 border-b border-white/[0.06] flex-shrink-0">
+   <div className="flex items-center gap-2.5"><div className="relative"><div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-sm font-bold text-white shadow-lg shadow-emerald-900/30">⚡</div><span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0d0d0d] ${isStreaming?'bg-amber-400 animate-pulse':'bg-emerald-400'}`}/></div><div><div className="text-sm font-semibold text-white">Odessyus Agent</div><div className="text-xs text-neutral-500 font-mono">{verificationRequired?<span className="text-amber-400/90">Human verification required</span>:isStreaming?<span className="text-amber-400/80 flex items-center gap-1.5"><span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"/>Analyzing · fixture DAG active…</span>:`Ready · ${AGENTS.length}-specialist orchestration · search-only mode`}</div></div></div>
+   <div className="flex items-center gap-2">
+    {retrieveAvailable&&<button type="button" onClick={()=>void handleRetrieveFpl()} disabled={retrieving||isStreaming} className="flex items-center gap-1.5 text-xs text-emerald-300 hover:text-emerald-200 disabled:opacity-40 transition-colors px-3 py-1.5 rounded-lg bg-emerald-500/[0.08] border border-emerald-500/20 hover:bg-emerald-500/[0.14]" title="Retrieve the saved FPL result without rerunning analysis">{retrieving?'Retrieving…':'↻ Retrieve FPL Result'}</button>}
+    <button onClick={onNewChat} disabled={verificationRequired} className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-200 disabled:opacity-40 transition-colors px-3 py-1.5 rounded-lg hover:bg-white/[0.06] border border-transparent hover:border-white/[0.06]">New chat</button>
+   </div>
+  </div>
   <div className="flex-1 overflow-y-auto scrollable">
    {isStreaming&&(<div className="max-w-3xl mx-auto px-4 pt-4"><div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-3"><div className="flex items-center justify-between text-[10px] font-mono text-neutral-500 mb-2"><span>LIVE SPECIALIST CONTROL PLANE · SEARCH-ONLY</span><span>{fixtureCount?`${fixtureCount} fixture jobs`: 'discovering fixtures…'}</span></div><div className="grid grid-cols-2 md:grid-cols-3 gap-2">{agentPlan.map((a:any)=><div key={a.name} className="rounded-lg bg-black/20 border border-white/[0.05] px-2.5 py-2"><div className="text-[10px] font-semibold text-neutral-300 truncate">{a.name}</div><div className="text-[9px] text-neutral-600 font-mono mt-0.5">{queueSnapshot[a.name]?`active ${queueSnapshot[a.name].active} · queue ${queueSnapshot[a.name].queued}`:'fixture-scoped'}</div></div>)}</div></div></div>)}
    {verificationRequired&&liveBrowserVisual&&(<div className="max-w-3xl mx-auto px-4 pt-4"><div className="rounded-2xl overflow-hidden border border-amber-500/30 bg-black/50 shadow-xl"><div className="px-4 py-3 border-b border-amber-500/20 bg-amber-500/[0.08]"><div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"/><span className="text-xs font-semibold text-amber-200">HUMAN VERIFICATION REQUIRED</span></div><div className="text-[11px] text-neutral-400 mt-1">{verification.challengeType||liveBrowserVisual.verificationType||'Website verification challenge'} · browser paused in search-only mode.</div></div><div className="relative bg-black"><img src={liveBrowserVisual.image} alt="Live browser verification page" className="block w-full max-h-[500px] object-contain bg-black select-none" draggable={false} onClick={e=>{const r=e.currentTarget.getBoundingClientRect();void runVerificationAction({type:'click',x:(e.clientX-r.left)*(1280/r.width),y:(e.clientY-r.top)*(720/r.height)});}}/></div><div className="grid grid-cols-4 gap-2 p-3 border-t border-white/[0.06]"><button onClick={()=>void runVerificationAction({type:'scroll',deltaY:-600})} className="rounded-lg bg-white/[0.05] text-xs text-neutral-300 py-2">↑ Scroll up</button><button onClick={()=>void runVerificationAction({type:'scroll',deltaY:600})} className="rounded-lg bg-white/[0.05] text-xs text-neutral-300 py-2">↓ Scroll down</button><button onClick={()=>void runVerificationAction({type:'key',key:'Tab'})} className="rounded-lg bg-white/[0.05] text-xs text-neutral-300 py-2">Tab</button><button onClick={()=>void runVerificationAction({type:'key',key:'Enter'})} className="rounded-lg bg-white/[0.05] text-xs text-neutral-300 py-2">Enter</button></div><div className="px-3 pb-3 flex items-center gap-2"><input aria-label="Verification text input" placeholder="Type into the live browser…" onKeyDown={e=>{if(e.key==='Enter'&&e.currentTarget.value){void runVerificationAction({type:'text',text:e.currentTarget.value});e.currentTarget.value='';}}} className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-xs text-neutral-200 outline-none"/><button disabled={verificationResuming} onClick={()=>resumeVerification().catch(err=>setVerificationError(err instanceof Error?err.message:'Could not resume verification'))} className="rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-semibold text-xs px-4 py-2">{verificationResuming?'Resuming…':'Resume analysis'}</button></div>{verificationError&&<div className="px-3 pb-3 text-xs text-red-300">{verificationError}</div>}</div></div>)}
