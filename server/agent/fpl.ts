@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { analyzeFplManagerIntel } from './fpl-manager-intel.js';
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
 const FPL_FIXTURES = 'https://fantasy.premierleague.com/api/fixtures/';
@@ -60,6 +61,13 @@ function candidateScore(p:FplPlayer,fixtureDifficulty:number,fixturesThisGw:numb
   return (ep*0.50 + form*0.16 + value*0.10 + bps*0.08 + minutesRate*0.10 + Math.max(0,Math.min(0.06,momentum)))*fixtureBoost*avail;
 }
 
+function applyManagerIntel(base:number,intel:{roleSecurity:number;minutesRisk:number;tacticalUpside:number;confidence:number}){
+  const roleAdj=(intel.roleSecurity-0.5)*0.34;
+  const minutesAdj=-intel.minutesRisk*0.28;
+  const tacticalAdj=intel.tacticalUpside*0.18;
+  return Math.max(0,base + (roleAdj+minutesAdj+tacticalAdj)*Math.max(0.35,intel.confidence));
+}
+
 function buildFixtureMap(fixtures:FplFixture[],gw:number){
   const map=new Map<number,{difficulty:number;count:number}>();
   for(const f of fixtures.filter(x=>x.event===gw&&!x.finished)){
@@ -69,9 +77,13 @@ function buildFixtureMap(fixtures:FplFixture[],gw:number){
   return map;
 }
 
-function optimizeSquad(players:FplPlayer[],teams:FplTeam[],fixtures:FplFixture[],gw:number){
+function optimizeSquad(players:FplPlayer[],teams:FplTeam[],fixtures:FplFixture[],gw:number,intelMap=new Map<string,{roleSecurity:number;minutesRisk:number;tacticalUpside:number;confidence:number}>()){
   const fmap=buildFixtureMap(fixtures,gw); const teamMap=new Map(teams.map(t=>[t.id,t]));
-  const enriched=players.filter(p=>p.status!=='u'&&availability(p)>0.55).map(p=>({p,score:candidateScore(p,fmap.get(p.team)?.difficulty??3,fmap.get(p.team)?.count??1),difficulty:fmap.get(p.team)?.difficulty??3,fixtures:fmap.get(p.team)?.count??0}));
+  const enriched=players.filter(p=>p.status!=='u'&&availability(p)>0.55).map(p=>{
+    const base=candidateScore(p,fmap.get(p.team)?.difficulty??3,fmap.get(p.team)?.count??1);
+    const intel=intelMap.get(`${p.team}:${p.web_name}`);
+    return {p,score:intel?applyManagerIntel(base,intel):base,difficulty:fmap.get(p.team)?.difficulty??3,fixtures:fmap.get(p.team)?.count??0,managerIntel:intel};
+  });
   const byPos=(pos:number)=>enriched.filter(x=>x.p.element_type===pos).sort((a,b)=>b.score-a.score);
   const selected:FplPlayer[]=[]; const clubCount=new Map<number,number>(); let budget=1000;
   const add=(x:{p:FplPlayer})=>{if(selected.length>=15)return false;const c=clubCount.get(x.p.team)||0;if(c>=3||x.p.now_cost>budget)return false;selected.push(x.p);clubCount.set(x.p.team,c+1);budget-=x.p.now_cost;return true;};
@@ -81,7 +93,6 @@ function optimizeSquad(players:FplPlayer[],teams:FplTeam[],fixtures:FplFixture[]
     for(const x of [...pool].sort((a,b)=>a.p.now_cost-b.p.now_cost).slice(0,quota)) add(x);
     for(const x of pool) if(selected.filter(p=>p.element_type===pos).length<quota) add(x);
   }
-  // Budget-aware upgrade passes: swap one selected player for a higher score alternative when constraints permit.
   for(let pass=0;pass<8;pass++){
     let changed=false;
     for(let i=0;i<selected.length;i++){
@@ -95,7 +106,7 @@ function optimizeSquad(players:FplPlayer[],teams:FplTeam[],fixtures:FplFixture[]
     }
     if(!changed)break;
   }
-  const scored=selected.map(p=>{const e=enriched.find(x=>x.p.id===p.id)!;return{player:p,score:e.score,difficulty:e.difficulty,fixtures:e.fixtures,team:teamMap.get(p.team)?.name||'Unknown'};});
+  const scored=selected.map(p=>{const e=enriched.find(x=>x.p.id===p.id)!;return{player:p,score:e.score,difficulty:e.difficulty,fixtures:e.fixtures,team:teamMap.get(p.team)?.name||'Unknown',managerIntel:e.managerIntel||null};});
   return {selected:scored,budgetRemaining:budget};
 }
 
@@ -103,7 +114,6 @@ function chooseXI(squad:Array<ReturnType<typeof optimizeSquad>['selected'][numbe
   const ranked=[...squad].sort((a,b)=>b.score-a.score); const gks=ranked.filter(x=>x.player.element_type===1); const defs=ranked.filter(x=>x.player.element_type===2); const mids=ranked.filter(x=>x.player.element_type===3); const fwds=ranked.filter(x=>x.player.element_type===4);
   const xi=[gks[0],fwds[0]]; const remaining=[...defs,...mids].sort((a,b)=>b.score-a.score);
   xi.push(...remaining.slice(0,9));
-  // Ensure at least three defenders; replace weakest mid if necessary.
   const defCount=xi.filter(x=>x.player.element_type===2).length;
   if(defCount<3){const needed=3-defCount;const extras=defs.slice(defCount,defCount+needed);for(const ex of extras){const replace=xi.filter(x=>x.player.element_type===3).sort((a,b)=>a.score-b.score)[0];if(replace){const idx=xi.indexOf(replace);xi[idx]=ex;}}}
   const captain=[...xi].sort((a,b)=>b.score-a.score)[0]; const vice=[...xi].filter(x=>x.player.id!==captain.player.id).sort((a,b)=>b.score-a.score)[0];
@@ -114,20 +124,24 @@ export async function buildFplWeeklyTeam(input:Record<string,unknown>={}):Promis
   try{
     const [data,fixtures]=await Promise.all([fetchJson<FplResponse>(FPL_BOOTSTRAP),fetchJson<FplFixture[]>(FPL_FIXTURES)]);
     const gw=nextGameweek(data); if(!gw) throw new Error('No upcoming FPL Gameweek found');
-    const opt=optimizeSquad(data.elements,data.teams,fixtures,gw.id); const plan=chooseXI(opt.selected);
-    const names=(ids:number[])=>ids.map(id=>data.elements.find(p=>p.id===id)?.web_name||String(id));
-    const topCandidates=opt.selected.sort((a,b)=>b.score-a.score).slice(0,8).map(x=>x.player.web_name);
-    const news=topCandidates.length?await searchWeb(`FPL Gameweek ${gw.id} ${topCandidates.join(' ')} injury lineup team news 2026/27`):'';
+    const teamMap=new Map(data.teams.map(t=>[t.id,t]));
+    const initialPlayers=data.elements.filter(p=>p.status!=='u'&&availability(p)>0.55).sort((a,b)=>numeric(b.ep_next)-numeric(a.ep_next)).slice(0,24);
+    const managerIntelResult=await analyzeFplManagerIntel(initialPlayers.map(p=>({player:p.web_name,club:teamMap.get(p.team)?.name||'Unknown'})));
+    const intelMap=new Map(managerIntelResult.data.map(i=>[`${data.teams.find(t=>t.name===i.club)?.id??-1}:${i.player}`,{roleSecurity:i.roleSecurity,minutesRisk:i.minutesRisk,tacticalUpside:i.tacticalUpside,confidence:i.confidence}]));
+    const opt=optimizeSquad(data.elements,data.teams,fixtures,gw.id,intelMap); const plan=chooseXI(opt.selected);
+    const news=managerIntelResult.data.flatMap(i=>i.latestEvidence||[]).join('\n--- MANAGER INTEL ---\n').slice(0,9000);
     const transferNote=typeof input.current_squad==='string'?`Current squad supplied: ${String(input.current_squad).slice(0,1500)}`:'No current squad supplied; returning a recommended squad rather than forced transfers.';
-    const fmt=(x:any)=>`${x.player.web_name} (${x.team}) £${(x.player.now_cost/10).toFixed(1)} | model ${x.score.toFixed(2)} | FDR ${x.difficulty} | ${x.fixtures} fixture${x.fixtures===1?'':'s'}`;
+    const fmt=(x:any)=>`${x.player.web_name} (${x.team}) £${(x.player.now_cost/10).toFixed(1)} | model ${x.score.toFixed(2)} | FDR ${x.difficulty} | ${x.fixtures} fixture${x.fixtures===1?'':'s'}${x.managerIntel?` | role ${x.managerIntel.roleSecurity.toFixed(2)} | minutes risk ${x.managerIntel.minutesRisk.toFixed(2)}`:''}`;
+    const managerSignals=managerIntelResult.data.filter(i=>i.sentiment!=='neutral').sort((a,b)=>b.confidence-a.confidence).slice(0,12);
     const out={
       gameweek:gw.id,deadline:gw.deadline_time,budget:`£${(opt.budgetRemaining/10).toFixed(1)}m remaining`,
       squad:opt.selected.map(fmt),starting_xi:plan.xi.map(fmt),bench:plan.bench.map(fmt),captain:fmt(plan.captain),vice_captain:fmt(plan.vice),
       transfer_guidance:transferNote,
+      manager_role_intelligence:managerSignals.map(i=>({player:i.player,club:i.club,sentiment:i.sentiment,role_security:i.roleSecurity,minutes_risk:i.minutesRisk,tactical_upside:i.tacticalUpside,signals:i.quoteSignals,confidence:i.confidence,freshness_days:i.freshnessDays})),
       chip_guidance:'Default to saving chips in ordinary single-fixture Gameweeks; assess Wildcard/Free Hit/Bench Boost/Triple Captain around genuine Blank or Double Gameweeks. Only one chip can be used per Gameweek.',
-      methodology:'Official FPL prices/projected points/form/availability + fixture difficulty + minutes reliability + value/BPS signals, with search-based team-news sanity checking. No player is treated as confirmed starting unless official/current evidence supports it.',
-      fpl_rules_2026_27:{squad:'15 players: 2 GK, 5 DEF, 5 MID, 3 FWD',budget:'£100m',club_limit:3,free_transfers:'1 per Gameweek, bankable up to 5',chips:'Wildcard, Free Hit, Bench Boost and Triple Captain twice per season, once in each half',captain:'doubles score',defensive_contributions:'2 points at 10 CBIT for defenders; 12 defensive contributions for midfielders/forwards'},
-      search_news_context:news.slice(0,7000)
+      methodology:'Official FPL prices/projected points/form/availability + fixture difficulty + minutes reliability + value/BPS signals, with manager press-conference/role intelligence as a secondary, freshness-weighted signal. Manager sentiment cannot override objective availability and is never treated as confirmed lineup evidence by itself.',
+      fpl_rules_2026_27:{squad:'15 players: 2 GK, 5 DEF, 5 MID, 3 FWD',budget:'£100m',club_limit:3,free_transfers:'1 per Gameweek, bankable up to 5',chips:'Wildcard, Free Hit, Bench Boost and Triple Captain twice per season, once in each half',captain:'doubles score',defensive_contributions:'2 points at 10 CBIT for defenders; 12 defensive contributions for midfielders/forwards',bps:'2026/27 BPS changed to reduce overlap with defensive contribution points and improve prospects for goalkeepers, full-backs and attackers'},
+      search_news_context:news
     };
     return {success:true,data:JSON.stringify(out),source:'fpl_weekly_team'};
   }catch(e){return{success:false,data:'',error:e instanceof Error?e.message:String(e),source:'fpl_weekly_team'};}
