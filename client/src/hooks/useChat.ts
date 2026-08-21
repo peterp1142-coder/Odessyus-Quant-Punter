@@ -7,6 +7,15 @@ interface LiveBrowserVisual { image:string; url?:string; hint?:string; capturedA
 interface VerificationState { status:'required'|'resuming'|'completed'|'expired'|null; challengeType?:string; reason?:string; url?:string; title?:string; }
 interface UseChatOptions { conversationId:string; initialMessages?:ChatMessage[]; onMessagesChange?:(messages:ChatMessage[])=>void; }
 
+async function readApiError(res:Response, fallback:string):Promise<string>{
+  try {
+    const body=await res.json() as {error?:string;message?:string};
+    return body.error||body.message||`${fallback} (HTTP ${res.status})`;
+  } catch {
+    return `${fallback} (HTTP ${res.status})`;
+  }
+}
+
 export function useChat({conversationId,initialMessages=[],onMessagesChange}:UseChatOptions) {
   const [messages,setMessages]=useState<ChatMessage[]>(initialMessages);
   const [isStreaming,setIsStreaming]=useState(false);
@@ -51,12 +60,12 @@ export function useChat({conversationId,initialMessages=[],onMessagesChange}:Use
 
   const verificationAction=useCallback(async(action:{type:'click';x:number;y:number}|{type:'scroll';deltaY:number}|{type:'key';key:string}|{type:'text';text:string})=>{
     const res=await fetch(`/api/chat/verification/action/${encodeURIComponent(sessionIdRef.current)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
-    if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||'Verification action failed');
+    if(!res.ok)throw new Error(await readApiError(res,'Verification action failed'));
   },[]);
 
   const resumeVerification=useCallback(async()=>{
     const res=await fetch(`/api/chat/verification/resume/${encodeURIComponent(sessionIdRef.current)}`,{method:'POST'});
-    if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||'Could not resume verification');
+    if(!res.ok)throw new Error(await readApiError(res,'Could not resume verification'));
     setVerification(v=>({...v,status:'resuming'}));
   },[]);
 
@@ -105,7 +114,7 @@ export function useChat({conversationId,initialMessages=[],onMessagesChange}:Use
       const body:Record<string,string>={sessionId:sessionIdRef.current};
       if(preset)body.preset=preset;else body.message=text.trim();
       const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-      if(!res.ok)throw new Error('Failed to queue agent job');
+      if(!res.ok)throw new Error(await readApiError(res,'Failed to queue agent job'));
       const data=await res.json() as {sessionId:string;jobId:string};
       attachToJob(data.sessionId,assistantMsgId);
     }catch(err){setIsStreaming(false);streamingIdRef.current=null;setMessages(prev=>prev.map(m=>m.id===assistantMsgId?{...m,content:`⚠️ ${err instanceof Error?err.message:'Failed to start agent job'}`,isStreaming:false}:m));}
