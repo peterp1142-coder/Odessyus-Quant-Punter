@@ -81,7 +81,16 @@ export function duckDuckGoFeedSearch(query: string): Promise<DuckDuckGoFeedResul
       const url = `${DDG_HTML}?${new URLSearchParams({ q: normalized, kl: 'us-en', kp: '-2' })}`;
       const response = await fetchTimeout(url);
       if (!response.ok) {
-        return { success: false, items: [], data: '', error: `DuckDuckGo HTTP ${response.status}`, source: 'duckduckgo_feed', query: normalized, retrievedAt };
+        const failure: DuckDuckGoFeedResult = {
+          success: false,
+          items: [],
+          data: '',
+          error: `DuckDuckGo HTTP ${response.status}`,
+          source: 'duckduckgo_feed',
+          query: normalized,
+          retrievedAt,
+        };
+        return failure;
       }
 
       const html = await response.text();
@@ -101,20 +110,49 @@ export function duckDuckGoFeedSearch(query: string): Promise<DuckDuckGoFeedResul
         }
         if (!title && !snippet) return;
         let sourceDomain = '';
-        try { sourceDomain = new URL(urlValue).hostname.replace(/^www\./, ''); } catch { sourceDomain = displayedUrl.replace(/^https?:\/\//, '').split('/')[0]; }
+        try {
+          sourceDomain = new URL(urlValue).hostname.replace(/^www\./, '');
+        } catch {
+          sourceDomain = displayedUrl.replace(/^https?:\/\//, '').split('/')[0];
+        }
         items.push({ title, snippet, url: urlValue, sourceDomain });
       });
 
       const cleanItems = dedupe(items).slice(0, MAX_RESULTS);
       if (!cleanItems.length) {
-        return { success: false, items: [], data: '', error: 'No DuckDuckGo results', source: 'duckduckgo_feed', query: normalized, retrievedAt };
+        const failure: DuckDuckGoFeedResult = {
+          success: false,
+          items: [],
+          data: '',
+          error: 'No DuckDuckGo results',
+          source: 'duckduckgo_feed',
+          query: normalized,
+          retrievedAt,
+        };
+        return failure;
       }
 
-      const value: DuckDuckGoFeedResult = { success: true, items: cleanItems, data: format(cleanItems, normalized, retrievedAt), source: 'duckduckgo_feed', query: normalized, retrievedAt };
+      const value: DuckDuckGoFeedResult = {
+        success: true,
+        items: cleanItems,
+        data: format(cleanItems, normalized, retrievedAt),
+        source: 'duckduckgo_feed',
+        query: normalized,
+        retrievedAt,
+      };
       cache.set(key, { expires: Date.now() + CACHE_TTL, value });
       return value;
     } catch (error) {
-      return { success: false, items: [], data: '', error: String(error), source: 'duckduckgo_feed', query: normalized, retrievedAt };
+      const failure: DuckDuckGoFeedResult = {
+        success: false,
+        items: [],
+        data: '',
+        error: String(error),
+        source: 'duckduckgo_feed',
+        query: normalized,
+        retrievedAt,
+      };
+      return failure;
     }
   })().finally(() => inflight.delete(key));
 
