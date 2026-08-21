@@ -1,0 +1,113 @@
+name: Harden search-only runtime
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: ${{ !startsWith(github.event.head_commit.message, '[search-only-hardening]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch search-only browser and discovery gates
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          tools = Path('server/agent/tools.ts')
+          text = tools.read_text()
+
+          marker = "const BROWSER_HEADERS = { 'User-Agent': DESKTOP_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };"
+          guard = marker + "\nconst SEARCH_ONLY_MODE = /^(1|true|yes)$/i.test(process.env.SEARCH_ONLY_MODE || 'false');\n"
+          if "const SEARCH_ONLY_MODE =" not in text:
+              if marker not in text:
+                  raise SystemExit('BROWSER_HEADERS marker not found')
+              text = text.replace(marker, guard, 1)
+
+          # Never resolve a Chromium executable in search-only mode.
+          old = "function findChromeExecutable(): string | null {\n  const configured = [process.env.LOCAL_CHROME_PATH, process.env.PUPPETEER_EXECUTABLE_PATH].filter(Boolean) as string[];"
+          new = "function findChromeExecutable(): string | null {\n  if (SEARCH_ONLY_MODE) return null;\n  const configured = [process.env.LOCAL_CHROME_PATH, process.env.PUPPETEER_EXECUTABLE_PATH].filter(Boolean) as string[];"
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          # Make the browser manager fail fast with an explicit search-only message.
+          old = "if(!executablePath) throw new Error('Local Chromium executable not found. Set LOCAL_CHROME_PATH or PUPPETEER_EXECUTABLE_PATH to the installed Chrome binary.');"
+          new = "if(!executablePath) throw new Error(SEARCH_ONLY_MODE ? 'Browser disabled: SEARCH_ONLY_MODE=true' : 'Local Chromium executable not found. Set LOCAL_CHROME_PATH or PUPPETEER_EXECUTABLE_PATH to the installed Chrome binary.');"
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          # Sanitize ISO dates coming from model-generated tool inputs.
+          helper = '''\nfunction normalizeIsoDate(value: unknown, fallback = new Date().toISOString().slice(0,10)): string {\n  const raw = String(value ?? '');\n  const match = raw.match(/(20\\d{2}-\\d{2}-\\d{2})/);\n  return match ? match[1] : fallback;\n}\n'''
+          if 'function normalizeIsoDate(' not in text:
+              anchor = "function keyPool(name: string): string[] { return (process.env[name] || '').split(',').map(x => x.trim()).filter(Boolean); }\n"
+              if anchor not in text:
+                  raise SystemExit('keyPool anchor not found')
+              text = text.replace(anchor, anchor + helper, 1)
+
+          # Replace AllSports fixture entrypoint with sanitized, search-first behavior.
+          pattern = re.compile(r"export async function allSportsFixtures\([\s\S]*?\n}\n\nexport async function allSportsLivescore", re.M)
+          replacement = '''export async function allSportsFixtures(dateFrom: string, dateTo = dateFrom): Promise<ToolResult> {\n  const from = normalizeIsoDate(dateFrom);\n  const to = normalizeIsoDate(dateTo, from);\n  const pool = keyPool('ALL_SPORTS_APIs');\n  if (pool.length) {\n    for (let i=0;i<pool.length;i++) {\n      const key=pool[allSportsIdx++%pool.length];\n      try {\n        const p=new URLSearchParams({met:'Fixtures',APIkey:key,from,to});\n        const r=await fetchWithTimeout(`${ALLSPORTS_URL}?${p}`,{headers:{Accept:'application/json'}},SEARCH_TIMEOUT);\n        if(!r.ok) continue;\n        const j=await r.json() as any;\n        if(!j.success||!j.result?.length) continue;\n        const lines=j.result.map((e:any)=>`${e.event_date} ${e.event_time||''} | ${e.event_home_team} vs ${e.event_away_team} | ${e.event_league_name||e.league_name||''} (${e.event_country_name||''}) | ${e.event_status||''}`);\n        return {success:true,data:truncate(`[AllSports Fixtures ${from}–${to}]\\n${lines.join('\\n')}`,12000),source:'allsports_fixtures'};\n      } catch {}\n    }\n  }\n  const queries = await Promise.allSettled([\n    serpSearch(`football fixtures ${from} ${to}`),\n    taloredataSearch(`football fixtures ${from} ${to}`),\n    duckDuckGoFeedSearch(`football fixtures ${from} ${to}`),\n  ]);\n  const evidence = queries.filter(x=>x.status==='fulfilled' && x.value.success).map(x=>(x as PromiseFulfilledResult<any>).value.data).join('\\n--- INDEPENDENT FIXTURE SOURCE ---\\n');\n  return evidence ? {success:true,data:truncate(`[Search Fixture Discovery ${from}–${to}]\\n${evidence}`,14000),source:'allsports_fixtures:search-fallback'} : {success:false,data:'',error:'No structured or search fixture sources available',source:'allsports_fixtures'};\n}\n\nexport async function allSportsLivescore'''
+          if pattern.search(text):
+              text = pattern.sub(replacement, text, count=1)
+          else:
+              raise SystemExit('allSportsFixtures function pattern not found')
+
+          # Search-only fetch_matches_today: never invokes scrape or browser.
+          pattern = re.compile(r"export async function fetchMatchesToday\([\s\S]*?\n}\nexport async function multiSourceOdds", re.M)
+          replacement = '''export async function fetchMatchesToday(sport='football',dateStr?:string):Promise<ToolResult>{\n  const today=normalizeIsoDate(dateStr);\n  const queries = await Promise.allSettled([\n    allSportsFixtures(today,today),\n    serpSearch(`${sport} fixtures today ${today}`),\n    taloredataSearch(`${sport} fixtures today ${today}`),\n    duckDuckGoFeedSearch(`${sport} fixtures today ${today}`),\n  ]);\n  const data=queries.filter(x=>x.status==='fulfilled'&&x.value.success).map(x=>(x as PromiseFulfilledResult<ToolResult>).value.data).filter(Boolean);\n  return data.length?{success:true,data:truncate(`[Date: ${today}] [Sport: ${sport}]\\n${data.join('\\n\\n--- INDEPENDENT SOURCE ---\\n')}`,20000),source:'fetch_matches_today:search-only'}:taloredataSearch(`${sport} fixtures today ${today}`);\n}\nexport async function multiSourceOdds'''
+          if pattern.search(text):
+              text = pattern.sub(replacement, text, count=1)
+          else:
+              raise SystemExit('fetchMatchesToday function pattern not found')
+
+          # Search-only odds path: search, don't scrape bookmaker pages.
+          pattern = re.compile(r"export async function multiSourceOdds\([\s\S]*?\n}\nexport async function fetchFbrefStats", re.M)
+          replacement = '''export async function multiSourceOdds(fixture:string):Promise<ToolResult>{\n  const queries = await Promise.allSettled([\n    serpSearch(`${fixture} odds today bookmaker`),\n    taloredataSearch(`${fixture} odds today bookmaker`),\n    duckDuckGoFeedSearch(`${fixture} odds today bookmaker`),\n  ]);\n  const data=queries.filter(x=>x.status==='fulfilled'&&x.value.success).map(x=>(x as PromiseFulfilledResult<ToolResult>).value.data).join('\\n--- ODDS SOURCE ---\\n');\n  return data?{success:true,data:truncate(data,16000),source:'multi_source_odds:search-only'}:taloredataSearch(`${fixture} odds today`);\n}\nexport async function fetchFbrefStats'''
+          if pattern.search(text):
+              text = pattern.sub(replacement, text, count=1)
+          else:
+              raise SystemExit('multiSourceOdds function pattern not found')
+
+          # Dispatcher: in search-only mode, never touch browser-backed tools.
+          text = text.replace("case 'fetch_url':{const u=String(input.url||'');", "case 'fetch_url':{const u=String(input.url||'');if(SEARCH_ONLY_MODE)return taloredataSearch(fallbackQuery(u,input));")
+          text = text.replace("case 'scrape':{const u=String(input.url||'');", "case 'scrape':{const u=String(input.url||'');if(SEARCH_ONLY_MODE)return taloredataSearch(fallbackQuery(u,input));")
+          text = text.replace("case 'book_slip':return bookSlip", "case 'book_slip':if(SEARCH_ONLY_MODE)return taloredataSearch(fallbackQuery(String(input.url||input.bookmaker_url||''),input));return bookSlip")
+
+          tools.write_text(text)
+
+          # Stop the prompt from advertising browser-first legacy tools in search-only mode.
+          prompt = Path('server/agent/prompts.ts')
+          p = prompt.read_text()
+          p = p.replace("5. fetch_url            — {\"url\": \"https://...\"} — static reader when enabled\n6. scrape               — {\"url\": \"https://...\", \"selector\": \"CSS\", \"waitTime\": 7000} — browser when enabled\n", "5. fetch_url            — {\"url\": \"https://...\"} — disabled in search-only mode; use search APIs instead\n6. scrape               — {\"url\": \"https://...\", \"selector\": \"CSS\", \"waitTime\": 7000} — disabled in search-only mode\n")
+          p = p.replace("7. fetch_matches_today  — {\"sport\": \"football\", \"date\": \"YYYY-MM-DD\"} — fixture discovery\n", "7. fetch_matches_today  — {\"sport\": \"football\", \"date\": \"YYYY-MM-DD\"} — search-only fixture discovery\n")
+          p = p.replace("- For fixtures: allsports_fixtures first, then search channels for independent validation", "- For fixtures: allsports_fixtures first, then Serper + Talordata + DuckDuckGo for independent validation")
+          prompt.write_text(p)
+
+      - name: TypeScript validation
+        run: |
+          npm install --no-audit --no-fund
+          npm run build:client
+          npm run build:server
+
+      - name: Commit hardening patch to main
+        run: |
+          git config user.name "odessyus-bot"
+          git config user.email "odessyus-bot@users.noreply.github.com"
+          git add server/agent/tools.ts server/agent/prompts.ts
+          if git diff --cached --quiet; then
+            echo "No changes required"
+            exit 0
+          fi
+          git commit -m "[search-only-hardening] disable browser and harden fixture discovery"
+          git push origin main
