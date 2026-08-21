@@ -5,7 +5,7 @@ const FETCH_TIMEOUT = 10_000;
 const MAX_RESULTS = 12;
 const MAX_CHARS = 9_000;
 
-type FeedItem = {
+export type FeedItem = {
   title: string;
   snippet: string;
   url: string;
@@ -75,7 +75,7 @@ export function duckDuckGoFeedSearch(query: string): Promise<DuckDuckGoFeedResul
   const pending = inflight.get(key);
   if (pending) return pending;
 
-  const work = (async () => {
+  const work: Promise<DuckDuckGoFeedResult> = (async () => {
     const retrievedAt = new Date().toISOString();
     try {
       const url = `${DDG_HTML}?${new URLSearchParams({ q: normalized, kl: 'us-en', kp: '-2' })}`;
@@ -110,7 +110,7 @@ export function duckDuckGoFeedSearch(query: string): Promise<DuckDuckGoFeedResul
         return { success: false, items: [], data: '', error: 'No DuckDuckGo results', source: 'duckduckgo_feed', query: normalized, retrievedAt };
       }
 
-      const value = { success: true, items: cleanItems, data: format(cleanItems, normalized, retrievedAt), source: 'duckduckgo_feed' as const, query: normalized, retrievedAt };
+      const value: DuckDuckGoFeedResult = { success: true, items: cleanItems, data: format(cleanItems, normalized, retrievedAt), source: 'duckduckgo_feed', query: normalized, retrievedAt };
       cache.set(key, { expires: Date.now() + CACHE_TTL, value });
       return value;
     } catch (error) {
