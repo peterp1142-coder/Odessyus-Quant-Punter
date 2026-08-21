@@ -19,13 +19,32 @@ export function useSSE() {
     const query = params.toString();
     const url = `/api/chat/stream/${encodeURIComponent(sessionId)}${query ? `?${query}` : ''}`;
     const es = new EventSource(url); esRef.current=es;
-    es.addEventListener('connected',()=>callbacks.onConnected?.());
+    let opened=false;
+    let completed=false;
+    let reconnectTimer:number|undefined;
+    const reconnect=()=>{
+      if (completed) return;
+      if (reconnectTimer!==undefined) return;
+      reconnectTimer=window.setTimeout(()=>{
+        reconnectTimer=undefined;
+        stream(sessionId,'',callbacks,preset);
+      },1500);
+    };
+    es.addEventListener('connected',()=>{opened=true;callbacks.onConnected?.();});
     es.addEventListener('step',(e:MessageEvent)=>{try{callbacks.onStep?.(JSON.parse(e.data) as ReActStep);}catch{}});
-    es.addEventListener('complete',(e:MessageEvent)=>{try{callbacks.onComplete?.(JSON.parse(e.data));}catch{} es.close();esRef.current=null;});
+    es.addEventListener('complete',(e:MessageEvent)=>{completed=true;try{callbacks.onComplete?.(JSON.parse(e.data));}catch{} es.close();esRef.current=null;});
     es.addEventListener('saved',(e:MessageEvent)=>{try{callbacks.onSaved?.(JSON.parse(e.data));}catch{}});
-    es.addEventListener('error',(e:MessageEvent)=>{try{const d=JSON.parse(e.data||'{}');callbacks.onError?.(d.message||'Stream error');}catch{callbacks.onError?.('Connection error');} es.close();esRef.current=null;});
-    es.onerror=()=>{es.close();esRef.current=null;};
-    return ()=>{es.close();esRef.current=null;};
+    es.addEventListener('error',(e:MessageEvent)=>{
+      try{
+        const d=JSON.parse(e.data||'{}');
+        if (d?.message && !completed) callbacks.onError?.(d.message);
+      }catch{}
+      if (!completed) reconnect();
+    });
+    es.onerror=()=>{
+      if (!completed) reconnect();
+    };
+    return ()=>{completed=true;if(reconnectTimer!==undefined)window.clearTimeout(reconnectTimer);es.close();if(esRef.current===es)esRef.current=null;};
   },[]);
   const cancel=useCallback(()=>{if(esRef.current){esRef.current.close();esRef.current=null;}},[]);
   return {stream,cancel};
