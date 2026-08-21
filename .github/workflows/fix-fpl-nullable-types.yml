@@ -1,0 +1,51 @@
+name: Fix FPL nullable numeric types
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/agent/fpl.ts'
+      - '.github/workflows/fix-fpl-nullable-types.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: ${{ !contains(github.event.head_commit.message, '[auto-fix-fpl-types]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --no-audit --no-fund
+      - name: Normalize FPL Gameweek ids to number
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('server/agent/fpl.ts')
+          s = p.read_text()
+          s2 = s.replace('gw.id', 'Number(gw.id)')
+          if s2 == s:
+              print('No gw.id replacements required')
+          else:
+              p.write_text(s2)
+          PY
+      - name: TypeScript validation
+        run: npm run build:server
+      - name: Commit fixed FPL typing
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/agent/fpl.ts
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: normalize FPL gameweek numeric types [auto-fix-fpl-types]"
+            git push origin main
+          fi
