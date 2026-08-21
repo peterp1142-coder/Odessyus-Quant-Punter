@@ -24,6 +24,8 @@ interface ChatMessage { role: MessageRole; content: string; }
 
 const MAX_ITERATIONS = 12;
 const AGENT_NAME     = 'ReActMain';
+const SEARCH_ONLY_MODE = /^(1|true|yes)$/i.test(process.env.SEARCH_ONLY_MODE || '');
+const BROWSER_BACKED_TOOLS = new Set(['scrape','scrape_flashscore','fetch_matches_today','multi_source_odds','fetch_lineups','book_slip']);
 
 function ts(): string { return new Date().toISOString(); }
 
@@ -46,8 +48,6 @@ function parseReActResponse(content: string): {
   const inputMatch   = trimmed.match(/Action Input:\s*([\s\S]*?)(?=Thought:|Action:|FINAL_ANSWER:|$)/i);
 
   const thought   = thoughtMatch?.[1]?.trim() || '';
-  // Strip markdown bold (**tool**), backticks (`tool`), and stray asterisks
-  // that the LLM sometimes wraps around the tool name.
   const rawAction = (actionMatch?.[1]?.trim() || '').replace(/^[*`]+|[*`]+$/g, '').trim();
   const rawInput  = inputMatch?.[1]?.trim()   || '{}';
 
@@ -95,7 +95,6 @@ export async function runReActLoop(
   const poolStatus = mistralPool.status();
   emit({ type: 'status', content: `🔍 Odessyus initializing — ${poolStatus.total} key(s) in pool (${poolStatus.available} available)…` });
 
-  // ── Checkpoint: try to resume ──────────────────────────────────────────
   const existing = await loadCheckpoint(sessionId, AGENT_NAME);
   let messages: ChatMessage[];
   let startIteration: number;
@@ -150,12 +149,20 @@ export async function runReActLoop(
         return { steps, finalAnswer: assistantContent, success: true };
       }
 
-      // Action step
       if (parsed.thought) emit({ type: 'thought', content: parsed.thought, iteration });
 
       if (!parsed.toolName) {
         emit({ type: 'error', content: 'No tool specified.', iteration });
         break;
+      }
+
+      if (SEARCH_ONLY_MODE && BROWSER_BACKED_TOOLS.has(parsed.toolName)) {
+        const observationText = `ERROR: ${parsed.toolName} is disabled in SEARCH_ONLY_MODE. Use serper_search, talordata_search, duckduckgo_feed, web_search, fetch_url or structured APIs instead.`;
+        emit({ type: 'action', content: `Blocked disabled tool ${parsed.toolName}`, toolName: parsed.toolName, toolInput: parsed.toolInput, iteration });
+        emit({ type: 'observation', content: observationText, iteration });
+        messages.push({ role: 'assistant', content: assistantContent });
+        messages.push({ role: 'user', content: `Observation: ${observationText}` });
+        continue;
       }
 
       emit({ type: 'action', content: `Calling ${parsed.toolName}`, toolName: parsed.toolName, toolInput: parsed.toolInput, iteration });
@@ -179,7 +186,6 @@ export async function runReActLoop(
       messages.push({ role: 'assistant', content: assistantContent });
       messages.push({ role: 'user',      content: `Observation: ${observationText.substring(0, 6000)}` });
 
-      // ── Checkpoint after each iteration ─────────────────────────────
       await saveCheckpoint({
         sessionId, agentName: AGENT_NAME, messages, iteration,
         steps: [...steps], rawOutput: assistantContent,
@@ -187,7 +193,6 @@ export async function runReActLoop(
       });
     }
 
-    // Force final answer after max iterations
     emit({ type: 'status', content: '📝 Synthesizing prediction across all gathered feature vectors…' });
     messages.push({
       role: 'user',
