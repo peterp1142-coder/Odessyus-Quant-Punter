@@ -9,6 +9,7 @@ RUNTIME CAPABILITY CONTRACT
 - If a tool is disabled, do not retry it, do not wrap it in another tool, and do not ask for it again.
 - Use the next-best enabled search/structured-data source instead.
 - A tool error saying "disabled" is a capability signal, not an invitation to retry.
+- IMPORTANT: fetch_url is a lightweight Node.js HTTP/static-page reader. It is NOT Chromium and is NOT the browser. fetch_url remains allowed in SEARCH-ONLY mode and should be used when a direct page read is useful.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ABSOLUTE RULES — NEVER BREAK THESE
@@ -37,9 +38,9 @@ AVAILABLE TOOLS
 2. talordata_search
 3. web_search
 4. duckduckgo_feed
-5. fetch_url (ONLY when runtime capability state says ENABLED)
-6. scrape (ONLY when runtime capability state says ENABLED)
-7. fetch_matches_today (ONLY when runtime capability state says ENABLED)
+5. fetch_url — lightweight Node.js HTTP/static page reader; available in search-only mode
+6. scrape — browser/Chromium tool; ONLY when runtime capability state says ENABLED
+7. fetch_matches_today — browser-backed discovery helper; ONLY when runtime capability state says ENABLED
 8. allsports_fixtures
 9. allsports_livescore
 10. multi_source_odds
@@ -51,17 +52,20 @@ AVAILABLE TOOLS
 
 TOOL PRIORITY
 - For broad web research: serper_search → talordata_search → duckduckgo_feed → web_search
-- For fixtures: allsports_fixtures first, then search channels for independent validation
-- For statistics: structured/stat tools first, then targeted search cross-checks
-- For lineups: structured lineup data first, then targeted current search evidence
+- For a specific source/page when a direct read is useful: fetch_url is allowed and preferred over scrape while the browser is disabled
+- For fixtures: allsports_fixtures first, then search channels to independently validate
+- For statistics: structured/stat tools first, then targeted search cross-checks; fetch_url may read known static pages directly
+- For lineups: structured lineup data first, then targeted current search evidence; fetch_url may read known static pages directly
 - For odds: multi_source_odds first; do not call an unverified price current
 - For FPL: fpl_weekly_team for the numerical squad optimization; supplement it with current manager/player intelligence when needed
 
 SEARCH-ONLY OPERATING MODE
 When runtime capability state says browser/scraper are DISABLED:
-- DO NOT CALL fetch_url, scrape, fetch_matches_today, or any browser-backed helper.
+- DO NOT CALL scrape, fetch_matches_today, or any browser-backed helper.
 - DO NOT try to make the browser work by supplying another URL, selector, or wait time.
 - DO NOT repeat a disabled action after an error.
+- fetch_url IS ALLOWED because it uses Node.js HTTP and does not launch Chromium.
+- Use fetch_url for direct reads of known lightweight/static pages when search snippets are insufficient.
 - Use AllSports/structured APIs first for fixtures and current scores.
 - Use Serper, Talordata, DuckDuckGo feed, and web_search for independent discovery and verification.
 - Use search queries targeted to the exact fixture/player/date.
@@ -161,8 +165,8 @@ export function getCurrentSeason(now = new Date()): string {
 export function buildSystemPrompt(currentDatetime = new Date()): string {
   const browserEnabled = !/^(1|true|yes)$/i.test(process.env.SEARCH_ONLY_MODE || '');
   const capabilities = browserEnabled
-    ? 'RUNTIME CAPABILITIES: browser/scraper ENABLED. fetch_url, scrape and browser-backed helpers may be used when appropriate.'
-    : 'RUNTIME CAPABILITIES: browser/scraper DISABLED. Do not call fetch_url, scrape, fetch_matches_today, or browser-backed helpers. Use structured APIs + Serper + Talordata + DuckDuckGo feed + web_search only.';
+    ? 'RUNTIME CAPABILITIES: browser/scraper ENABLED. fetch_url (Node.js HTTP), scrape and browser-backed helpers may be used when appropriate.'
+    : 'RUNTIME CAPABILITIES: browser/scraper DISABLED. fetch_url (Node.js HTTP/static reader) remains ENABLED. Do not call scrape, fetch_matches_today, or other browser-backed helpers. Use fetch_url + structured APIs + Serper + Talordata + DuckDuckGo feed + web_search.';
 
   return `${capabilities}\n\n${SYSTEM_PROMPT}`
     .replace(/\\{\\{CURRENT_DATETIME\\}\\}/g, currentDatetime.toISOString())
