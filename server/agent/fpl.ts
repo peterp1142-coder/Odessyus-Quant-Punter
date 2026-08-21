@@ -61,7 +61,53 @@ function playerFixtureProfile(p:FplPlayer,fixtures:FplFixture[],startGw:number){
 function managerAdjustment(intel?:ManagerSignal){ if(!intel)return 0; const freshness=intel.freshnessDays<=2?1:intel.freshnessDays<=4?0.8:intel.freshnessDays<=7?0.55:intel.freshnessDays<=14?0.25:0.1; const role=(intel.roleSecurity-0.5)*1.2; const mins=-intel.minutesRisk*1.5; const tactical=intel.tacticalUpside*0.8; const sentiment=intel.sentiment==='positive'?0.18:intel.sentiment==='negative'?-0.18:0; return (role+mins+tactical+sentiment)*Math.max(0.35,intel.confidence)*freshness; }
 function scorePlayer(p:FplPlayer,fixtures:FplFixture[],startGw:number,intel?:ManagerSignal):EnrichedPlayer{ const team=(globalThis as any).__fplTeamMap.get(p.team) as FplTeam|undefined; if(!team)throw new Error(`FPL team ${p.team} not found for ${p.web_name}`); const prof=playerFixtureProfile(p,fixtures,startGw); const minsRate=Math.min(1,Math.max(0,p.minutes/(HORIZON*90))); const avail=availability(p); const epNext=Math.max(0,numeric(p.ep_next)); const ppg=Math.max(0,numeric(p.points_per_game)); const form=Math.max(0,numeric(p.form)); const value=Math.max(0,numeric(p.value_form)); const valueSeason=Math.max(0,numeric(p.value_season)); const bonusRate=Math.max(0,p.bonus/Math.max(1,p.minutes/90)); const bpsRate=Math.max(0,p.bps/Math.max(1,p.minutes)); const threat=Math.max(0,numeric(p.threat)); const creativity=Math.max(0,numeric(p.creativity)); const influence=Math.max(0,numeric(p.influence)); const ict=Math.max(0,numeric(p.ict_index)); const fixtureQuality=Math.max(0,Math.min(1,(5.4-prof.avg)/4.4)); const teamStrength=(team.strength||3)/5; const roleAdj=managerAdjustment(intel); const baseGameweek=epNext*0.35+form*0.12+ppg*0.10+value*0.08+valueSeason*0.04+fixtureQuality*1.10+teamStrength*0.50+Math.min(1,minsRate)*0.95+Math.min(1,threat/120)*0.18+Math.min(1,creativity/120)*0.12+Math.min(1,influence/120)*0.08+Math.min(1,ict/40)*0.10+Math.min(1,bpsRate*25)*0.08+Math.min(1,bonusRate/2)*0.08; const projected6=Math.max(0,(epNext*HORIZON*0.72)+(ppg*HORIZON*0.22)+(fixtureQuality*HORIZON*0.70)+(teamStrength*HORIZON*0.35)+(form*HORIZON*0.08)+roleAdj); const valueRoom=Math.min(1,Math.max(0,1-(numeric(p.now_cost)-40)/100)); const score=(projected6*0.62+baseGameweek*0.28+valueRoom*0.10)*avail*Math.max(0.35,minsRate); return {p,team,score,projected6,minutesRate:minsRate,fixtureAvg:prof.avg,fixtureCount:prof.count,managerIntel:intel}; }
 type BeamState={selected:EnrichedPlayer[];budget:number;club:Map<number,number>;score:number};
-function optimizeSquad(enriched:EnrichedPlayer[]):{selected:EnrichedPlayer[];budgetRemaining:number;score:number}{ const grouped=new Map<number,EnrichedPlayer[]>(); for(const x of enriched){const arr=grouped.get(x.p.element_type)||[];arr.push(x);grouped.set(x.p.element_type,arr);} for(const [pos,arr] of grouped)grouped.set(pos,arr.sort((a,b)=>b.score-a.score).slice(0,pos===1?18:pos===2?45:pos===3?55:35)); let states:BeamState[]=[{selected:[],budget:1000,club:new Map(),score:0}]; const slots:number[]=[]; for(const pos of [1,2,3,4])for(let i=0;i<posQuota(pos);i++)slots.push(pos); for(const pos of slots){ const pool=grouped.get(pos)||[]; const next:BeamState[]=[]; const seen=new Set<string>(); for(const state of states){ for(const x of pool){ if(state.selected.some(s=>s.p.id===x.p.id))continue; if((state.club.get(x.p.team)||0)>=3)continue; const nb=state.budget-x.p.now_cost; if(nb<0)continue; const selected=[...state.selected,x]; const club=new Map(state.club); club.set(x.p.team,(club.get(x.p.team)||0)+1); const key=`${selected.map(s=>s.p.id).sort((a,b)=>a-b).join(',')}|${nb}`; if(seen.has(key))continue; seen.add(key); next.push({selected,budget:nb,club,score:state.score+x.score}); } } next.sort((a,b)=>b.score-a.score); states=next.slice(0,BEAM_WIDTH); if(!states.length)throw new Error(`Unable to satisfy FPL ${positionName(pos)} quota under £100m/club constraints`); } const best=states[0]; return{selected:best.selected,budgetRemaining:best.budget,score:best.score}; }
+function optimizeSquad(enriched:EnrichedPlayer[]):{selected:EnrichedPlayer[];budgetRemaining:number;score:number}{
+  const grouped=new Map<number,EnrichedPlayer[]>();
+  for(const x of enriched){const arr=grouped.get(x.p.element_type)||[];arr.push(x);grouped.set(x.p.element_type,arr);}
+  for(const [pos,arr] of grouped) grouped.set(pos,arr.sort((a,b)=>b.score-a.score).slice(0,pos===1?18:pos===2?45:pos===3?55:35));
+
+  const slots:number[]=[];
+  for(const pos of [1,2,3,4]) for(let i=0;i<posQuota(pos);i++) slots.push(pos);
+  const cheapestCostByPos=new Map<number,number>();
+  for(const [pos,arr] of grouped){ const cheapest=arr.reduce((m,x)=>Math.min(m,x.p.now_cost),Infinity); if(Number.isFinite(cheapest)) cheapestCostByPos.set(pos,cheapest); }
+  const minCostForRemaining=(from:number)=>{ let total=0; for(let i=from;i<slots.length;i++){ const c=cheapestCostByPos.get(slots[i]); if(c==null)return Infinity; total+=c; } return total; };
+
+  let states:BeamState[]=[{selected:[],budget:1000,club:new Map(),score:0}];
+  for(let slotIndex=0;slotIndex<slots.length;slotIndex++){
+    const pos=slots[slotIndex];
+    const pool=grouped.get(pos)||[];
+    const next:BeamState[]=[];
+    const seen=new Set<string>();
+    for(const state of states){
+      for(const x of pool){
+        if(state.selected.some(s=>s.p.id===x.p.id)) continue;
+        if((state.club.get(x.p.team)||0)>=3) continue;
+        const nb=state.budget-x.p.now_cost;
+        if(nb<0) continue;
+        const minimumFuture=minCostForRemaining(slotIndex+1);
+        if(nb<minimumFuture) continue;
+        const selected=[...state.selected,x];
+        const club=new Map(state.club); club.set(x.p.team,(club.get(x.p.team)||0)+1);
+        const key=`${selected.map(s=>s.p.id).sort((a,b)=>a-b).join(',')}|${nb}`;
+        if(seen.has(key)) continue;
+        seen.add(key);
+        next.push({selected,budget:nb,club,score:state.score+x.score});
+      }
+    }
+    if(!next.length){
+      throw new Error(`Unable to satisfy FPL ${positionName(pos)} quota under £100m/club constraints; budget-feasibility pruning exhausted all states`);
+    }
+    next.sort((a,b)=>b.score-a.score);
+    const keepByScore=next.slice(0,BEAM_WIDTH*2);
+    const keepByBudget=[...next].sort((a,b)=>b.budget-a.budget).slice(0,Math.max(250,Math.floor(BEAM_WIDTH/3)));
+    const merged=new Map<string,BeamState>();
+    for(const s of [...keepByScore,...keepByBudget]) merged.set(`${s.selected.map(x=>x.p.id).sort((a,b)=>a-b).join(',')}|${s.budget}`,s);
+    states=[...merged.values()].sort((a,b)=>b.score-a.score).slice(0,BEAM_WIDTH);
+  }
+  const best=states[0];
+  if(!best) throw new Error('FPL optimizer produced no legal squad');
+  return{selected:best.selected,budgetRemaining:best.budget,score:best.score};
+}
 function chooseXI(squad:EnrichedPlayer[]){ const gk=[...squad].filter(x=>x.p.element_type===1).sort((a,b)=>b.score-a.score); const def=[...squad].filter(x=>x.p.element_type===2).sort((a,b)=>b.score-a.score); const mid=[...squad].filter(x=>x.p.element_type===3).sort((a,b)=>b.score-a.score); const fwd=[...squad].filter(x=>x.p.element_type===4).sort((a,b)=>b.score-a.score); const candidates:{xi:EnrichedPlayer[];score:number;shape:string}[]=[]; for(const d of [3,4,5])for(const m of [3,4,5]){ const f=11-1-d-m; if(f<1||f>3||def.length<d||mid.length<m||fwd.length<f||gk.length<1)continue; const xi=[gk[0],...def.slice(0,d),...mid.slice(0,m),...fwd.slice(0,f)]; candidates.push({xi,score:xi.reduce((s,x)=>s+x.score,0),shape:`${d}-${m}-${f}`}); } const best=candidates.sort((a,b)=>b.score-a.score)[0]; if(!best)throw new Error('Unable to construct a legal starting XI from the optimized squad'); const xi=best.xi; const bench=squad.filter(x=>!xi.some(y=>y.p.id===x.p.id)).sort((a,b)=>b.score-a.score); const captain=[...xi].sort((a,b)=>b.score-a.score)[0]; const vice=[...xi].filter(x=>x.p.id!==captain.p.id).sort((a,b)=>b.score-a.score)[0]; if(!captain||!vice)throw new Error('Unable to assign captain and vice-captain'); return{xi,bench,captain,vice,formation:best.shape}; }
 export async function buildFplWeeklyTeam(input:Record<string,unknown>={}):Promise<{success:boolean;data:string;error?:string;source?:string}>{
   const jobId=typeof input.__job_id==='string'?String(input.__job_id):'';
