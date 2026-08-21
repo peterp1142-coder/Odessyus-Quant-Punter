@@ -183,8 +183,9 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
         try { predictionId = await persistPrediction(sessionId, result); }
         catch (err) { console.error('[Chat] Save prediction:', describeError(err)); }
       }
-      try { await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]); }
-      catch (err) { console.error('[Chat] Save assistant msg:', describeError(err)); }
+      try {
+        await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'assistant', result.finalAnswer]);
+      } catch (err) { console.error('[Chat] Save assistant msg:', describeError(err)); }
     }
 
     const metadata = { ...(result.metadata || {}), ...(predictionId ? { predictionId } : {}) };
@@ -198,22 +199,62 @@ async function executeJob(jobId:string, sessionId:string, effectiveMessage:strin
   }
 }
 
+// Retrieve the latest completed FPL run for a session without rerunning the optimizer.
+router.get('/retrieve-fpl/:sessionId', async (req:Request,res:Response) => {
+  try {
+    const rows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status='completed' ORDER BY created_at DESC LIMIT 20`, [req.params.sessionId]);
+    for (const job of rows) {
+      const metadata = parseJson<Record<string,any>>(job.result_metadata, {});
+      if (metadata.mode !== 'FPL_DEDICATED_OPTIMIZER') continue;
+      let payload = metadata.fpl && typeof metadata.fpl === 'object' ? metadata.fpl : null;
+      if (!payload && job.final_answer) {
+        try {
+          const parsed = JSON.parse(job.final_answer);
+          if (parsed && typeof parsed === 'object' && parsed.mode === 'FPL_DEDICATED_OPTIMIZER') payload = parsed;
+        } catch { /* legacy runs may already contain Markdown */ }
+      }
+      const finalAnswer = payload ? formatFplMarkdown(payload) : (job.final_answer || '');
+      return res.json({
+        available:true,
+        sessionId:req.params.sessionId,
+        jobId:job.id,
+        finalAnswer,
+        metadata:{...metadata, fpl:payload || metadata.fpl || null, retrieved:true},
+        completedAt:(job as any).updated_at || null,
+      });
+    }
+    return res.json({available:false,sessionId:req.params.sessionId});
+  } catch (err) {
+    console.error('[Chat] Retrieve FPL result:', describeError(err));
+    return res.status(500).json({available:false,error:'Failed to retrieve saved FPL result'});
+  }
+});
+
 router.post('/', async (req:Request,res:Response) => {
   const { message, sessionId: existing, preset } = req.body as { message?:string; sessionId?:string; preset?:string };
   const internalPreset = preset ? getAgentPreset(preset) : null;
   if (!message?.trim() && !internalPreset) return res.status(400).json({error:'Message is required'});
   if (preset && !internalPreset) return res.status(400).json({error:'Unknown agent preset'});
   const sessionId = existing || uuidv4();
+
   console.log(`[Chat] Queue request session=${sessionId} preset=${preset || 'none'} message=${message?.trim() ? 'present' : 'none'}`);
+
   try {
     const active = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
     if (active.length) return res.json({sessionId, jobId:active[0].id, status:active[0].status, resumed:true});
-    if (message?.trim() && !internalPreset) await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'user', message.trim()]);
+
+    if (message?.trim() && !internalPreset) {
+      await query(`INSERT INTO conversations (id, session_id, channel, role, content) VALUES (?, ?, ?, ?, ?)`, [uuidv4(), sessionId, 'web', 'user', message.trim()]);
+    }
     const jobId = uuidv4();
     const effectiveMessage = (internalPreset || message || '').trim();
     await query(`INSERT INTO agent_jobs (id, session_id, message, preset, status, steps) VALUES (?, ?, ?, ?, 'queued', ?)`, [jobId, sessionId, message?.trim() || null, preset || null, JSON.stringify([])]);
     console.log(`[Chat] Queued agent job ${jobId} session=${sessionId} mode=${isFplRequest(effectiveMessage) ? 'FPL_DEDICATED_OPTIMIZER' : 'ORCHESTRATOR'}`);
-    void executeJob(jobId, sessionId, effectiveMessage).catch(err => console.error(`[Chat] Detached job worker crashed ${jobId}:`, describeError(err)));
+
+    void executeJob(jobId, sessionId, effectiveMessage).catch(err => {
+      console.error(`[Chat] Detached job worker crashed ${jobId}:`, describeError(err));
+    });
+
     res.json({sessionId, jobId, status:'queued'});
   } catch (err) {
     console.error('[Chat] Queue job:', describeError(err));
@@ -226,10 +267,14 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   const {message, preset} = req.query as {message?:string;preset?:string};
   let jobRows:JobRow[] = [];
   try {
-    if (message?.trim() || preset) jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
-    else jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+    if (message?.trim() || preset) {
+      jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+    } else {
+      jobRows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+    }
   } catch { return res.status(500).json({error:'Failed to load agent job'}); }
   if (!jobRows.length) return res.status(404).json({error:'No agent job found for session'});
+
   const job = jobRows[0];
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
@@ -240,7 +285,9 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
   const heartbeat = setInterval(()=>{if(!res.writableEnded)res.write(': heartbeat\n\n');},15000);
   let sentSteps = 0;
   let connected = false;
+
   sse('connected',{sessionId,jobId:job.id,engine:'orchestrator-v2-background',preset:job.preset || undefined,resumed:!message && !preset});
+
   const tick = async () => {
     try {
       const rows = await query<JobRow[]>(`SELECT * FROM agent_jobs WHERE id=? LIMIT 1`, [job.id]);
@@ -260,6 +307,7 @@ router.get('/stream/:sessionId', async (req:Request,res:Response) => {
     } catch { if (!connected) sse('error',{message:'Agent stream error'}); }
     return false;
   };
+
   await tick();
   const timer = setInterval(async()=>{ if (res.writableEnded) return; const done=await tick(); if(done){clearInterval(timer);clearInterval(heartbeat);res.end();} },1000);
   req.on('close',()=>{ clearInterval(timer); clearInterval(heartbeat); });
