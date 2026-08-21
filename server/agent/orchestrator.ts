@@ -31,6 +31,34 @@ const MAX_FIXTURE_PIPELINES = Number(process.env.MAX_FIXTURE_PIPELINES || 3);
 function marketToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); }
 function isTodayOrFuture(k?: string, requestedDate = '') { if (!k) return false; const d = new Date(k); return !Number.isNaN(d.getTime()) && d.getTime() > Date.now() - 120000 && d.toLocaleDateString('en-CA', { timeZone: MARKET_TIMEZONE }) === requestedDate; }
 function isCompletedStatus(status?: string) { const s = String(status || '').toLowerCase().trim(); return !!s && /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s); }
+function isGenericFixtureLabel(value: string) { return /\b(fixtures?|schedule|slate|league|premier division fixtures|championship fixtures|today(?:'s)? fixtures)\b/i.test(value) && !/\b(?:vs\.?|v\.?)\b/i.test(value); }
+function looksLikeMatch(value: string) {
+  const m = value.trim().match(/^(.{2,100}?)\s+(?:vs\.?|v\.?)\s+(.{2,100}?)$/i);
+  if (!m) return false;
+  const home = m[1].trim(), away = m[2].trim();
+  if (!home || !away || home.length < 2 || away.length < 2) return false;
+  if (/^(fixtures?|schedule|league|premier division|championship|today|tomorrow)$/i.test(home)) return false;
+  if (/^(fixtures?|schedule|league|premier division|championship|today|tomorrow)$/i.test(away)) return false;
+  return !/\bfixtures?\b/i.test(home) && !/\bfixtures?\b/i.test(away);
+}
+function normalizeFixtureName(value: string) { return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g, ' vs ').trim(); }
+
+function extractTextFixtures(raw: string, requestedDate: string): DiscoveredFixture[] {
+  const out: DiscoveredFixture[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const cleaned = line.replace(/^[-*•\d.)]+\s*/, '').replace(/\*+/g, '').trim();
+    const m = cleaned.match(/(.{2,100}?\s+(?:vs\.?|v\.?)\s+.{2,100}?)(?:\s*[-–—|,]\s*|\s+)(\d{1,2}:\d{2})(?:\s*(?:local time|UK time|UTC)?)?/i);
+    const fixture = (m?.[1] || cleaned).replace(/\s+(?:\([^)]*\))\s*$/,'').trim();
+    if (!looksLikeMatch(fixture) || isGenericFixtureLabel(fixture)) continue;
+    const key = normalizeFixtureName(fixture);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ fixture, kickoff: m ? `${requestedDate}T${m[2]}:00` : undefined, status: 'scheduled' });
+    if (out.length >= MAX_DISCOVERY_FIXTURES) break;
+  }
+  return out;
+}
 
 function balancedJsonCandidates(raw: string) {
   const text = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
@@ -52,22 +80,27 @@ function balancedJsonCandidates(raw: string) {
 
 function parseFixturePayload(raw: string): DiscoveredFixture[] {
   for (const candidate of balancedJsonCandidates(raw)) {
-    try { const value = JSON.parse(candidate) as any; const list = Array.isArray(value) ? value : Array.isArray(value?.fixtures) ? value.fixtures : []; if (list.length) return list as DiscoveredFixture[]; } catch {}
+    try {
+      const value = JSON.parse(candidate) as any;
+      const list = Array.isArray(value) ? value : Array.isArray(value?.fixtures) ? value.fixtures : [];
+      if (list.length) return list.filter((x: any) => x && typeof x.fixture === 'string');
+    } catch {}
   }
   return [];
 }
 
-function normalizeFixtureName(value: string) { return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g, ' vs ').trim(); }
-
 function validateFixtures(values: DiscoveredFixture[], requestedDate: string) {
-  const seen = new Set<string>(); const result: string[] = [];
+  const seen = new Set<string>(); const result: DiscoveredFixture[] = [];
   for (const value of values) {
     if (!value || typeof value.fixture !== 'string') continue;
+    const fixture = value.fixture.trim();
+    if (!looksLikeMatch(fixture) || isGenericFixtureLabel(fixture)) continue;
     if (isCompletedStatus(value.status)) continue;
-    if (!isTodayOrFuture(value.kickoff, requestedDate)) continue;
-    const fixture = value.fixture.trim(); if (fixture.length < 6) continue;
+    if (value.kickoff && !isTodayOrFuture(value.kickoff, requestedDate)) continue;
     const key = normalizeFixtureName(fixture); if (seen.has(key)) continue;
-    seen.add(key); result.push(fixture); if (result.length >= MAX_DISCOVERY_FIXTURES) break;
+    seen.add(key);
+    result.push({ ...value, fixture, status: value.status || 'scheduled' });
+    if (result.length >= MAX_DISCOVERY_FIXTURES) break;
   }
   return result;
 }
@@ -84,7 +117,8 @@ function extractStructuredFallback(schedule: string): DiscoveredFixture[] {
         const away = node.awayTeam?.name || node.away_team?.name || node.away?.name || node.awayTeam || node.away_team || node.away;
         const kickoff = node.kickoff || node.startTime || node.start_time || node.date || node.utcDate || node.utc_date;
         const status = node.status?.type?.short || node.status?.short || node.status || node.fixture?.status?.short;
-        if (typeof home === 'string' && typeof away === 'string' && typeof kickoff === 'string') results.push({ fixture: `${home} vs ${away}`, kickoff, status: typeof status === 'string' ? status : 'scheduled', competition: node.competition?.name || node.league?.name });
+        const fixture = typeof home === 'string' && typeof away === 'string' ? `${home} vs ${away}` : '';
+        if (looksLikeMatch(fixture) && typeof kickoff === 'string') results.push({ fixture, kickoff, status: typeof status === 'string' ? status : 'scheduled', competition: node.competition?.name || node.league?.name });
         for (const child of Object.values(node)) walk(child);
       };
       walk(value);
@@ -96,7 +130,7 @@ function extractStructuredFallback(schedule: string): DiscoveredFixture[] {
 async function repairFixturePayload(raw: string, matchDate: string): Promise<DiscoveredFixture[]> {
   try {
     const x = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
-      { role: 'system', content: 'Return only valid JSON: {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Copy only explicit fixtures; never invent.' },
+      { role: 'system', content: 'Return only valid JSON: {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Copy only explicit real matches; reject league names, fixture-list titles, headings, and generic labels. Never invent.' },
       { role: 'user', content: `Requested date ${matchDate}\nMalformed schedule:\n${raw.slice(0, 12000)}` },
     ] as any, temperature: 0, maxTokens: 2500 }));
     return parseFixturePayload(String(x.choices?.[0]?.message?.content || ''));
@@ -120,16 +154,20 @@ async function discoverFixtures(userQuery: string, sport: string, date: string, 
   const combined = sources.join('\n\n');
   if (!combined) return { fixtures: [], rawSchedule: '' };
   onStep({ type: 'thought', content: `📚 ${sources.length} independent schedule feeds collected; candidates are validated before specialist work.` });
-  let fixtures: DiscoveredFixture[] = [];
+  let modelFixtures: DiscoveredFixture[] = [];
   try {
     const r = await mistralPool.call(c => c.chat.complete({ model: 'mistral-small-latest', messages: [
-      { role: 'system', content: 'Extract all real future fixtures from supplied schedules. Do not limit to famous leagues. JSON only.' },
+      { role: 'system', content: 'Extract all real future fixtures from supplied schedules. Return only actual Home vs Away matches with kickoff times. Never return league titles, fixture-list headings, or generic labels. Do not limit to famous leagues. JSON only.' },
       { role: 'user', content: `User:${userQuery}\nDate:${date}\nTimezone:${MARKET_TIMEZONE}\nNow:${new Date().toISOString()}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct future fixtures from the ENTIRE supplied slate with verified ISO kickoff; omit started/live/finished/postponed/cancelled.` },
     ] as any, temperature: 0, maxTokens: Math.min(5000, 150 + MAX_DISCOVERY_FIXTURES * 140) }));
-    const raw = String(r.choices?.[0]?.message?.content || ''); fixtures = parseFixturePayload(raw); if (!fixtures.length) fixtures = await repairFixturePayload(raw, date);
+    const raw = String(r.choices?.[0]?.message?.content || ''); modelFixtures = parseFixturePayload(raw);
+    if (!modelFixtures.length) modelFixtures = await repairFixturePayload(raw, date);
   } catch (e) { onStep({ type: 'error', content: `Discovery model failed; deterministic fallback active: ${e instanceof Error ? e.message : String(e)}` }); }
-  let valid = validateFixtures(fixtures, date); if (!valid.length) valid = validateFixtures(extractStructuredFallback(combined), date);
-  if (!valid.length) onStep({ type: 'error', content: `⚠️ No verified future fixtures passed the temporal gate for ${date}.` }); else onStep({ type: 'thought', content: `📊 ${valid.length} future fixtures admitted to the fixture registry.` });
+  const textFixtures = extractTextFixtures(combined, date);
+  const structuredFixtures = extractStructuredFallback(combined);
+  const valid = validateFixtures([...modelFixtures, ...structuredFixtures, ...textFixtures], date);
+  if (!valid.length) onStep({ type: 'error', content: `⚠️ No verified future match fixtures passed the identity/temporal gate for ${date}.` });
+  else onStep({ type: 'thought', content: `📊 ${valid.length} canonical fixtures admitted to the fixture registry: ${valid.map(x => x.fixture).join(' | ')}` });
   return { fixtures: valid, rawSchedule: combined };
 }
 
@@ -147,7 +185,7 @@ async function parseQuery(userQuery: string) {
 }
 
 async function buildPlan(fixture: string): Promise<AgentPlan> {
-  return { reasoning: 'Fixture-scoped dependency DAG with FIFO specialist queues, adversarial review and portfolio validation.', agents: [
+  return { reasoning: 'Fixture-scoped dependency DAG with a canonical fixture registry, adversarial review and portfolio validation.', agents: [
     { name: 'OddsScout', focus: `Verify exact-market odds, opening/current price and price integrity for ${fixture}.`, required: true, tier: 1 },
     { name: 'FormScout', focus: `Verify current-season form, xG, venue performance and useful H2H for ${fixture}.`, required: true, tier: 1 },
     { name: 'InjuryIntel', focus: `Verify current injuries, suspensions and availability for ${fixture}.`, required: true, tier: 2 },
@@ -161,8 +199,12 @@ async function buildPlan(fixture: string): Promise<AgentPlan> {
   ] };
 }
 
+function canonicalFixtureContext(fixture: string, sport: string, matchDate: string, competition?: string) {
+  return `=== CANONICAL FIXTURE REGISTRY ENTRY ===\nFixture: ${fixture}\nSport: ${sport}\nMatch date: ${matchDate}\nCompetition: ${competition || 'verified by fixture registry'}\nRULE: This is the ONLY match this specialist is permitted to analyze. Do not rediscover, substitute, merge, or replace the fixture. If a source concerns another match, mark it irrelevant and do not use it as evidence.\n=== END CANONICAL FIXTURE REGISTRY ENTRY ===`;
+}
+
 async function dispatchOne(task: AgentTask, fixture: string, sport: string, matchDate: string, sessionId: string, prior: string, onStep: (s: ReActStep) => void): Promise<SubAgentResult> {
-  const taskText = `${task.focus}\n\n${prior}`;
+  const taskText = `${canonicalFixtureContext(fixture, sport, matchDate)}\n\n${task.focus}\n\n${prior}`;
   switch (task.name) {
     case 'OddsScout': return runOddsScout(fixture, sport, sessionId, onStep, taskText);
     case 'FormScout': return runFormScout(fixture, sport, sessionId, onStep, taskText);
@@ -188,56 +230,54 @@ function priorContext(acc: Record<string, SubAgentResult>) {
   return entries.length ? `=== PRIOR EVIDENCE ===\n${entries.map(([n, r]) => `[${n}] ${(r.rawOutput || JSON.stringify(r.data)).slice(0, 1800)}`).join('\n\n')}\n=== END PRIOR EVIDENCE ===` : '';
 }
 
-async function runFixturePipeline(fx: string, index: number, plan: AgentPlan, scheduleContext: string, sessionId: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
+async function runFixturePipeline(fx: DiscoveredFixture, index: number, plan: AgentPlan, scheduleContext: string, sessionId: string, sport: string, matchDate: string, onStep: (s: ReActStep) => void) {
   const results: Record<string, SubAgentResult> = {};
+  const fixture = fx.fixture;
+  const canonical = canonicalFixtureContext(fixture, sport, matchDate, fx.competition);
   for (const tier of [1, 2, 3, 4]) {
     const tasks = plan.agents.filter(a => a.tier === tier); if (!tasks.length) continue;
-    onStep({ type: 'status', content: `🚦 ${fx} · Tier ${tier}: ${tasks.map(t => t.name).join(' + ')}` });
-    const prior = `${scheduleContext}\n${priorContext(results)}`.trim();
-    const settled = await Promise.allSettled(tasks.map(task => dispatchAgent(task, fx, sport, matchDate, `${sessionId}-${index}-${task.name}`, prior, onStep)));
+    onStep({ type: 'status', content: `🚦 ${fixture} · Tier ${tier}: ${tasks.map(t => t.name).join(' + ')}` });
+    const prior = `${canonical}\n${scheduleContext}\n${priorContext(results)}`.trim();
+    const settled = await Promise.allSettled(tasks.map(task => dispatchAgent(task, fixture, sport, matchDate, `${sessionId}-${index}-${task.name}`, prior, onStep)));
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i], result = settled[i];
       if (result.status === 'fulfilled') {
         results[task.name] = result.value;
-        onStep({ type: result.value.success ? 'thought' : 'error', content: `${result.value.success ? '✅' : '⚠️'} ${fx} · ${task.name} ${result.value.success ? 'complete' : 'failed'}.` });
+        onStep({ type: result.value.success ? 'thought' : 'error', content: `${result.value.success ? '✅' : '⚠️'} ${fixture} · ${task.name} ${result.value.success ? 'complete' : 'failed'}.` });
       } else {
         const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
         results[task.name] = { agentName: task.name, success: false, data: {}, steps: [], rawOutput: '', error };
-        onStep({ type: 'error', content: `💥 ${fx} · ${task.name}: ${error}` });
+        onStep({ type: 'error', content: `💥 ${fixture} · ${task.name}: ${error}` });
       }
     }
     const requiredFailed = tasks.filter(t => t.required).some(t => !results[t.name]?.success);
-    if (requiredFailed) onStep({ type: 'error', content: `⛔ ${fx} · Tier ${tier} has missing required evidence; downstream gates remain fail-closed.` });
+    if (requiredFailed) onStep({ type: 'error', content: `⛔ ${fixture} · Tier ${tier} has missing required evidence; downstream gates remain fail-closed.` });
   }
   return results;
 }
 
-function aggregate(name: AgentName, registry: Record<string, Record<string, SubAgentResult>>): SubAgentResult {
+function aggregate(name: AgentName, registry: Record<string, Record<string, SubAgentResult>>) {
   const raws: string[] = []; const datas: Record<string, unknown> = {}; let successes = 0;
   for (const fx of Object.keys(registry)) { const result = registry[fx]?.[name]; if (!result) continue; if (result.success) successes++; raws.push(`=== ${fx} ===\n${result.rawOutput || JSON.stringify(result.data)}`); datas[fx] = result.data; }
-  return { agentName: name, success: successes > 0, data: { fixtures: datas }, steps: [], rawOutput: raws.join('\n\n'), error: successes ? '' : `No successful ${name} jobs` };
+  return { agentName: name, success: successes > 0, data: { fixtures: datas }, steps: [], rawOutput: raws.join('\n\n'), error: successes ? '' : `No successful ${name} jobs` } as SubAgentResult;
 }
 
-export async function runOrchestrator(userQuery: string, sessionId: string, onStep: (step: ReActStep) => void): Promise<OrchestratorResult> {
+async function runOrchestrator(userQuery: string, sessionId: string, onStep: (step: ReActStep) => void): Promise<OrchestratorResult> {
   const steps: ReActStep[] = [];
   const emit = (s: ReActStep) => { const x = { ...s, timestamp: new Date().toISOString() }; steps.push(x); onStep(x); };
   const pool = mistralPool.status(); emit({ type: 'status', content: `🧠 Odessyus initializing — ${pool.total} model keys, ${pool.available} available.` });
   const parsed = await parseQuery(userQuery);
   let { fixture, sport, market, matchDate } = parsed;
-  let fixtures: string[] = []; let schedule = '';
-
+  let fixtures: DiscoveredFixture[] = []; let schedule = '';
   if (!fixture || fixture === 'multiple/open' || fixture === userQuery) {
     const discovered = await discoverFixtures(userQuery, sport, matchDate, emit);
-    fixtures = discovered.fixtures; schedule = discovered.rawSchedule; if (fixtures.length) fixture = fixtures.join(' | ');
+    fixtures = discovered.fixtures; schedule = discovered.rawSchedule; if (fixtures.length) fixture = fixtures.map(x => x.fixture).join(' | ');
   }
   if (!fixtures.length && (fixture === 'multiple/open' || fixture === userQuery)) return { finalAnswer: `NO QUALIFIED FIXTURES: I could not verify any future, not-yet-started fixtures for ${matchDate}.`, steps, success: true, metadata: { fixture, sport, market, matchDate, agentsRun: [] } };
-
   const plan = await buildPlan(fixture);
   const registry: Record<string, Record<string, SubAgentResult>> = {};
   const scheduleContext = schedule ? `=== VERIFIED SCHEDULE ${matchDate} ===\n${schedule.slice(0, 5000)}` : '';
-  const pipelineFixtures = fixtures.length ? fixtures : [fixture];
-
-  // Independent fixture pipelines: each fixture can advance through its own DAG while specialists remain FIFO-bounded globally.
+  const pipelineFixtures = fixtures.length ? fixtures : [{ fixture, status: 'scheduled' }];
   let nextIndex = 0;
   const workerCount = Math.min(MAX_FIXTURE_PIPELINES, pipelineFixtures.length);
   const workers = Array.from({ length: workerCount }, async () => {
@@ -245,33 +285,30 @@ export async function runOrchestrator(userQuery: string, sessionId: string, onSt
       const index = nextIndex++;
       if (index >= pipelineFixtures.length) return;
       const fx = pipelineFixtures[index];
-      registry[fx] = await runFixturePipeline(fx, index, plan, scheduleContext, sessionId, sport, matchDate, emit);
+      registry[fx.fixture] = await runFixturePipeline(fx, index, plan, scheduleContext, sessionId, sport, matchDate, emit);
     }
   });
   await Promise.all(workers);
-
   let portfolio: SubAgentResult = { agentName: 'PortfolioRiskScout', success: false, data: {}, steps: [], rawOutput: '', error: 'not run' };
   const fixturesForPortfolio = Object.entries(registry).map(([fx, results]) => `=== ${fx} ===\n${priorContext(results)}`).join('\n\n');
-  if (pipelineFixtures.length > 1) portfolio = await dispatchAgent({ name: 'PortfolioRiskScout', focus: 'Review the entire candidate slate for correlation, common factors and concentration.', required: true, tier: 5 }, pipelineFixtures.join(' | '), sport, matchDate, `${sessionId}-portfolio`, fixturesForPortfolio, emit);
-
+  if (pipelineFixtures.length > 1) portfolio = await dispatchAgent({ name: 'PortfolioRiskScout', focus: 'Review the entire candidate slate for correlation, common factors and concentration.', required: true, tier: 5 }, pipelineFixtures.map(x => x.fixture).join(' | '), sport, matchDate, `${sessionId}-portfolio`, fixturesForPortfolio, emit);
   const odds = aggregate('OddsScout', registry);
   const form = aggregate('FormScout', registry);
   const injury = aggregate('InjuryIntel', registry);
   const sentiment = aggregate('SentimentAgent', registry);
   const lineup = aggregate('LineupScout', registry);
   const advancedText = [aggregate('RefereeScout', registry).rawOutput, aggregate('TacticalScout', registry).rawOutput, aggregate('MarketMicrostructureScout', registry).rawOutput, aggregate('ModelRiskScout', registry).rawOutput, aggregate('DataQualityScout', registry).rawOutput, portfolio.rawOutput].filter(Boolean).join('\n\n');
-
   try {
     const enrichedSentiment = { ...sentiment, rawOutput: [sentiment.rawOutput, '=== ADVANCED EVIDENCE ===', advancedText].join('\n') };
-    const q = await runQuantSynthesis({ userQuery, fixture, sport, market, sessionId, oddsResult: odds, formResult: form, injuryResult: injury, sentimentResult: enrichedSentiment, lineupResult: lineup, advancedText, onStep: emit, isMultiFixture: pipelineFixtures.length > 1, discoveredFixtures: pipelineFixtures });
-    if (!q.success) return { finalAnswer: q.finalAnswer || `⚠️ Synthesis failed: ${q.error || 'unknown error'}`, steps, success: false, error: q.error, metadata: { fixture, sport, market, fixtures: pipelineFixtures } };
+    const q = await runQuantSynthesis({ userQuery, fixture, sport, market, sessionId, oddsResult: odds, formResult: form, injuryResult: injury, sentimentResult: enrichedSentiment, lineupResult: lineup, advancedText, onStep: emit, isMultiFixture: pipelineFixtures.length > 1, discoveredFixtures: pipelineFixtures.map(x => x.fixture) });
+    if (!q.success) return { finalAnswer: q.finalAnswer || `⚠️ Synthesis failed: ${q.error || 'unknown error'}`, steps, success: false, error: q.error, metadata: { fixture, sport, market, fixtures: pipelineFixtures.map(x => x.fixture) } };
     const predictionId = `${sessionId}-${Date.now()}`;
     logPrediction({ predictionId, fixture, sport, market, predictedProb: q.trueProb, impliedProb: q.impliedProb, expectedValue: q.expectedValue, isValueBet: q.isValueBet, starRating: q.starRating });
     emit({ type: 'synthesis', content: `🏆 ${pipelineFixtures.length > 1 ? `Multi-match synthesis complete for ${pipelineFixtures.length} fixtures` : 'Synthesis complete'} · FIFO queues drained · advanced risk gates applied.` });
     const agentsRun = plan.agents.map(a => a.name); if (portfolio.success) agentsRun.push('PortfolioRiskScout');
-    return { finalAnswer: q.finalAnswer, steps, success: true, metadata: { fixture, sport, market, matchDate, fixtures: pipelineFixtures, predictionId, probability: q.trueProb * 100, confidence: q.confidence, starRating: q.starRating, expectedValue: q.expectedValue, recommendedOdds: q.recommendedOdds, dataCompletenessScore: q.dataCompletenessScore, isValueBet: q.isValueBet, recommendedStake: q.recommendedStake, categoryProbabilities: q.categoryProbabilities, agentPlan: plan.agents, agentsRun, queueSnapshot: fixtureScheduler.snapshot(), researchCache: researchCacheStats(), fixtureRegistry: Object.fromEntries(Object.entries(registry).map(([fx, results]) => [fx, Object.fromEntries(Object.entries(results).map(([name, result]) => [name, result.success]))])), portfolioRisk: portfolio.data, poolStatus: mistralPool.status() } };
+    return { finalAnswer: q.finalAnswer, steps, success: true, metadata: { fixture, sport, market, matchDate, fixtures: pipelineFixtures.map(x => x.fixture), predictionId, probability: q.trueProb * 100, confidence: q.confidence, starRating: q.starRating, expectedValue: q.expectedValue, recommendedOdds: q.recommendedOdds, dataCompletenessScore: q.dataCompletenessScore, isValueBet: q.isValueBet, recommendedStake: q.recommendedStake, categoryProbabilities: q.categoryProbabilities, agentPlan: plan.agents, agentsRun, queueSnapshot: fixtureScheduler.snapshot(), researchCache: researchCacheStats(), fixtureRegistry: Object.fromEntries(Object.entries(registry).map(([fx, results]) => [fx, Object.fromEntries(Object.entries(results).map(([name, result]) => [name, result.success]))])), portfolioRisk: portfolio.data, poolStatus: mistralPool.status() } };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { finalAnswer: `⚠️ Synthesis failed: ${msg}`, steps, success: false, error: msg, metadata: { fixture, sport, market, fixtures: pipelineFixtures, queueSnapshot: fixtureScheduler.snapshot() } };
+    return { finalAnswer: `⚠️ Synthesis failed: ${msg}`, steps, success: false, error: msg, metadata: { fixture, sport, market, fixtures: pipelineFixtures.map(x => x.fixture), queueSnapshot: fixtureScheduler.snapshot() } };
   }
 }
