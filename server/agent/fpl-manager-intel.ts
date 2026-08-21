@@ -9,7 +9,7 @@ export interface ManagerIntel {
   tacticalUpside: number;
   quoteSignals: string[];
   latestEvidence: string[];
-  freshnessDays: number | null;
+  freshnessDays: number;
   confidence: number;
 }
 
@@ -61,10 +61,11 @@ export async function analyzeFplManagerIntel(
       const evidence = await search(q);
       const c = classify(evidence);
       const daysMatch = evidence.match(/(\d+)\s+days?\s+ago/i);
-      const freshnessDays = daysMatch ? Number(daysMatch[1]) : null;
+      // Unknown publication age is treated as stale rather than null so downstream scoring remains type-safe.
+      const freshnessDays = daysMatch ? Number(daysMatch[1]) : 999;
       const confidence = Math.max(
         0.2,
-        Math.min(0.95, (evidence.length > 1200 ? 0.82 : 0.55) - (freshnessDays !== null && freshnessDays > 7 ? 0.2 : 0))
+        Math.min(0.95, (evidence.length > 1200 ? 0.82 : 0.55) - (freshnessDays > 7 ? 0.2 : 0))
       );
       out.push({
         ...item,
@@ -83,7 +84,7 @@ export async function analyzeFplManagerIntel(
         tacticalUpside: 0.25,
         quoteSignals: [],
         latestEvidence: [],
-        freshnessDays: null,
+        freshnessDays: 999,
         confidence: 0.2
       });
     }
