@@ -15,7 +15,7 @@ interface FplPlayer {
 }
 interface FplTeam { id:number; name:string; short_name:string; code:number; strength:number; strength_overall_home:number; strength_overall_away:number; }
 interface FplFixture { event:number; team_h:number; team_a:number; team_h_difficulty:number; team_a_difficulty:number; finished:boolean; kickoff_time:string|null; }
-interface FplFixtureRaw { event:number|null; team_h:number; team_a:number; team_h_difficulty:number; team_a_difficulty:number; finished:boolean; kickoff_time:string|null; }
+interface FplFixtureRaw { event?:unknown; team_h?:unknown; team_a?:unknown; team_h_difficulty?:unknown; team_a_difficulty?:unknown; finished?:unknown; kickoff_time?:unknown; }
 interface FplEvent { id:number; name:string; deadline_time:string|null; finished:boolean; is_current:boolean; is_next:boolean; }
 interface FplResponse { elements:FplPlayer[]; teams:FplTeam[]; events:FplEvent[]; }
 interface ManagerSignal { roleSecurity:number; minutesRisk:number; tacticalUpside:number; confidence:number; sentiment:string; freshnessDays:number; quoteSignals:string[]; latestEvidence?:string[]; }
@@ -32,7 +32,18 @@ function posQuota(pos:number){return pos===1?2:pos===2?5:pos===3?5:3;}
 function positionName(pos:number){return pos===1?'GK':pos===2?'DEF':pos===3?'MID':'FWD';}
 function nextGameweek(data:FplResponse):FplEvent|null{ const event=data.events.find(e=>e.is_next)||data.events.find(e=>!e.finished&&e.deadline_time!==null&&new Date(e.deadline_time).getTime()>Date.now())||data.events.find(e=>e.is_current)||data.events[data.events.length-1]; return event??null; }
 function requireGameweekId(event:FplEvent|null):number{ const id=Number(event?.id); if(!Number.isInteger(id)||id<=0) throw new Error('No valid upcoming FPL Gameweek id found'); return id; }
-function normalizeFixtures(rows:FplFixtureRaw[]):FplFixture[]{ return rows.flatMap(r=>{ const event=Number(r.event); if(!Number.isInteger(event)||event<=0)return []; return [{...r,event}]; }); }
+function normalizeFixtures(rows:FplFixtureRaw[]):FplFixture[]{
+  const out:FplFixture[]=[];
+  for(const row of rows){
+    const event=Number(row.event);
+    if(!Number.isInteger(event)||event<=0) continue;
+    const team_h=Number(row.team_h), team_a=Number(row.team_a);
+    const homeDifficulty=Number(row.team_h_difficulty), awayDifficulty=Number(row.team_a_difficulty);
+    if(!Number.isInteger(team_h)||!Number.isInteger(team_a)||!Number.isFinite(homeDifficulty)||!Number.isFinite(awayDifficulty)) continue;
+    out.push({event,team_h,team_a,team_h_difficulty:homeDifficulty,team_a_difficulty:awayDifficulty,finished:Boolean(row.finished),kickoff_time:typeof row.kickoff_time==='string'?row.kickoff_time:null});
+  }
+  return out;
+}
 function buildHorizonFixtures(fixtures:FplFixture[],startGw:number){ return fixtures.filter(f=>!f.finished&&f.event>=startGw&&f.event<startGw+HORIZON); }
 function playerFixtureProfile(p:FplPlayer,fixtures:FplFixture[],startGw:number){ const rows=fixtures.filter(f=>!f.finished&&f.event>=startGw&&f.event<startGw+HORIZON&&(f.team_h===p.team||f.team_a===p.team)); if(!rows.length)return{avg:3.2,count:0,gwCount:0}; let difficultySum=0; for(const f of rows)difficultySum+=f.team_h===p.team?f.team_h_difficulty:f.team_a_difficulty; return{avg:difficultySum/rows.length,count:rows.length,gwCount:new Set(rows.map(r=>r.event)).size}; }
 function managerAdjustment(intel?:ManagerSignal){ if(!intel)return 0; const freshness=intel.freshnessDays<=2?1:intel.freshnessDays<=4?0.8:intel.freshnessDays<=7?0.55:intel.freshnessDays<=14?0.25:0.1; const role=(intel.roleSecurity-0.5)*1.2; const mins=-intel.minutesRisk*1.5; const tactical=intel.tacticalUpside*0.8; const sentiment=intel.sentiment==='positive'?0.18:intel.sentiment==='negative'?-0.18:0; return (role+mins+tactical+sentiment)*Math.max(0.35,intel.confidence)*freshness; }
