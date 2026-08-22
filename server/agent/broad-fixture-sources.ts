@@ -1,6 +1,8 @@
 /**
  * Broad fixture discovery using the local browser first, then structured APIs
- * and search providers when the deterministic FUTURE candidate pool is thin.
+ * and targeted search providers. Discovery is DAY/TIME aware: it targets the
+ * user's market date, the current local day/time, imminent kickoffs (next
+ * ~40 minutes) and the remaining future fixtures for that day.
  */
 import { serpSearch, taloredataSearch, allSportsFixtures, type ToolResult } from './tools.js';
 import { localBrowserFixtureDiscovery } from './local-fixture-discovery.js';
@@ -9,11 +11,46 @@ import { extractFixtureCandidates, serializeFixtureCandidates } from './fixture-
 const MAX_SEARCH_RESULTS = Number(process.env.MAX_DISCOVERY_FIXTURES || 100);
 const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
 const SEARCH_BATCH_SIZE = Math.max(1, Math.min(3, Number(process.env.DISCOVERY_SEARCH_CONCURRENCY || 3)));
-const SEARCH_QUERY_LIMIT = Math.max(7, Math.min(12, Number(process.env.DISCOVERY_SEARCH_QUERIES || 12)));
+const SEARCH_QUERY_LIMIT = Math.max(8, Math.min(12, Number(process.env.DISCOVERY_SEARCH_QUERIES || 12)));
 const SEARCH_IF_BELOW = Math.max(4, Number(process.env.DISCOVERY_SEARCH_IF_BELOW || 12));
+const IMMINENT_MINUTES = Math.max(20, Math.min(60, Number(process.env.DISCOVERY_IMMINENT_MINUTES || 40)));
+
+const LEAGUE_SEARCH_CATALOG = [
+  // England
+  'Premier League', 'Championship', 'League One', 'League Two', 'National League',
+  // Scotland / Ireland
+  'Scottish Premiership', 'Scottish Championship', 'Scottish League One', 'Scottish League Two',
+  // Spain / Italy / Germany / France / Portugal / Netherlands / Belgium / Turkey / Greece / Austria / Switzerland
+  'La Liga', 'Segunda Division', 'Serie A', 'Serie B', 'Bundesliga', '2. Bundesliga',
+  'Ligue 1', 'Ligue 2', 'Eredivisie', 'Primeira Liga', 'Belgian Pro League', 'Turkish Super Lig',
+  'Greek Super League', 'Austrian Bundesliga', 'Swiss Super League',
+  // Nordics
+  'Danish Superliga', 'Allsvenskan', 'Eliteserien', 'Veikkausliiga',
+  // Americas
+  'MLS', 'Liga MX', 'Brazil Serie A', 'Brazil Serie B', 'Argentina Liga Profesional',
+  'Colombia Primera A', 'Chile Primera Division',
+  // Asia / Middle East
+  'J1 League', 'J2 League', 'K League 1', 'Saudi Pro League', 'Qatar Stars League', 'UAE Pro League',
+  // Africa / continental
+  'South African Premiership', 'CAF Champions League', 'CAF Confederation Cup',
+  // Major continental competitions
+  'UEFA Champions League', 'UEFA Europa League', 'UEFA Conference League'
+];
 
 function todayInZone(date: Date, timeZone = MARKET_TIMEZONE): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+}
+
+function dayNameInZone(date: Date, timeZone = MARKET_TIMEZONE): string {
+  return new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long' }).format(date);
+}
+
+function localClockInZone(date: Date, timeZone = MARKET_TIMEZONE): string {
+  return new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
+}
+
+function plusMinutesIso(minutes: number): string {
+  return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
 function isFutureCandidate(candidate: { kickoff?: string; status?: string }): boolean {
@@ -24,21 +61,39 @@ function isFutureCandidate(candidate: { kickoff?: string; status?: string }): bo
   return Number.isFinite(ts) && ts >= Date.now() - 120_000;
 }
 
+function getTimeDistance(kickoff?: string): number {
+  if (!kickoff) return Number.POSITIVE_INFINITY;
+  const ts = new Date(kickoff).getTime();
+  return Number.isFinite(ts) ? ts - Date.now() : Number.POSITIVE_INFINITY;
+}
+
 async function runSearchesInBatches(date: string): Promise<ToolResult[]> {
+  const now = new Date();
+  const dayName = dayNameInZone(now);
+  const localTime = localClockInZone(now);
+  const imminentUntil = plusMinutesIso(IMMINENT_MINUTES);
+  const leagueGroups = [
+    LEAGUE_SEARCH_CATALOG.slice(0, 8).join(' | '),
+    LEAGUE_SEARCH_CATALOG.slice(8, 16).join(' | '),
+    LEAGUE_SEARCH_CATALOG.slice(16, 24).join(' | '),
+    LEAGUE_SEARCH_CATALOG.slice(24, 32).join(' | '),
+    LEAGUE_SEARCH_CATALOG.slice(32, 40).join(' | '),
+  ];
   const queries = [
-    `football fixtures ${date} all leagues today kickoff`,
-    `soccer fixtures ${date} today all leagues results schedule`,
-    `football matches ${date} Europe Asia Africa South America North America`,
-    `football fixtures ${date} site:flashscore.com OR site:sofascore.com OR site:livescore.com`,
-    `football fixtures ${date} site:espn.com OR site:bbc.com/sport/football`,
-    `football fixtures ${date} site:soccerway.com OR site:footystats.org`,
-    `football fixtures ${date} site:worldfootball.net OR site:globalsportsarchive.com`,
-    `Premier League fixtures ${date} Championship fixtures ${date} League One fixtures ${date}`,
-    `La Liga fixtures ${date} Serie A fixtures ${date} Bundesliga fixtures ${date}`,
-    `Ligue 1 fixtures ${date} Eredivisie fixtures ${date} Primeira Liga fixtures ${date}`,
-    `MLS fixtures ${date} Liga MX fixtures ${date} Brazil Serie A fixtures ${date} Argentina fixtures ${date}`,
-    `Africa football fixtures ${date} Asia football fixtures ${date} international football fixtures ${date}`,
+    `football fixtures ${date} ${dayName} after ${localTime} local time all leagues upcoming`,
+    `football matches ${date} today ${dayName} kickoffs after ${localTime} not started`,
+    `football fixtures ${date} next ${IMMINENT_MINUTES} minutes upcoming`,
+    `football fixtures ${date} remaining today future matches schedule`,
+    `soccer fixtures ${date} all competitions after ${localTime} upcoming`,
+    `football fixtures ${date} Europe Asia Africa South America North America after ${localTime}`,
+    `football fixtures ${date} ${leagueGroups[0]} upcoming`,
+    `football fixtures ${date} ${leagueGroups[1]} upcoming`,
+    `football fixtures ${date} ${leagueGroups[2]} upcoming`,
+    `football fixtures ${date} ${leagueGroups[3]} upcoming`,
+    `football fixtures ${date} ${leagueGroups[4]} upcoming`,
+    `football fixtures ${date} site:flashscore.com OR site:sofascore.com OR site:livescore.com upcoming`,
   ].slice(0, SEARCH_QUERY_LIMIT);
+
   const out: ToolResult[] = [];
   for (let i = 0; i < queries.length; i += SEARCH_BATCH_SIZE) {
     const batch = queries.slice(i, i + SEARCH_BATCH_SIZE);
@@ -50,11 +105,16 @@ async function runSearchesInBatches(date: string): Promise<ToolResult[]> {
 }
 
 async function runSecondarySearchesInBatches(date: string): Promise<ToolResult[]> {
+  const now = new Date();
+  const dayName = dayNameInZone(now);
+  const localTime = localClockInZone(now);
   const queries = [
-    `football fixtures ${date} all leagues today kickoff`,
-    `soccer fixtures ${date} Africa Europe Asia today`,
-    `football matches ${date} South America North America today`,
-    `football fixtures ${date} Premier League Serie A La Liga Bundesliga Ligue 1`,
+    `football fixtures ${date} ${dayName} after ${localTime} all leagues`,
+    `soccer fixtures ${date} next ${IMMINENT_MINUTES} minutes`,
+    `football matches ${date} remaining today upcoming not started`,
+    `football fixtures ${date} Premier League Serie A La Liga Bundesliga Ligue 1 upcoming`,
+    `football fixtures ${date} Brazil Argentina MLS Liga MX J1 K League Saudi upcoming`,
+    `football fixtures ${date} South Africa Primeira Liga Eredivisie Turkey Greece upcoming`,
   ];
   const out: ToolResult[] = [];
   for (let i = 0; i < queries.length; i += SEARCH_BATCH_SIZE) {
@@ -70,6 +130,12 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
   if (sport.toLowerCase() !== 'football') {
     return { success: false, data: '', error: 'Broad fixture discovery currently supports football only', source: 'broad_fixture_discovery' };
   }
+
+  const now = new Date();
+  const localDate = todayInZone(now);
+  const localDay = dayNameInZone(now);
+  const localTime = localClockInZone(now);
+  const imminentUntil = new Date(Date.now() + IMMINENT_MINUTES * 60_000);
 
   const [browser, api] = await Promise.all([
     localBrowserFixtureDiscovery(date, sport),
@@ -87,9 +153,9 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
   const firstFutureKeys = new Set(firstFutureCandidates.map(c => `${c.fixture.toLowerCase()}|${c.kickoff}`));
 
   let allSearches: ToolResult[] = [];
-  // Critical: a large number of primary candidates can simply mean the sources
-  // are full of matches that have already finished. Search expansion must be
-  // driven by FUTURE candidates, not total candidates.
+  // Search expansion is driven by FUTURE candidates, not total candidates.
+  // The search language explicitly encodes the current local day/time and
+  // separates imminent kickoffs from the remaining future slate.
   if (firstFutureKeys.size < SEARCH_IF_BELOW || !browser.success) {
     const searches = await runSearchesInBatches(date);
     const secondary = searches.filter(r => r.success && r.data).length < 3 || firstFutureKeys.size === 0
@@ -113,18 +179,28 @@ export async function broadFixtureDiscovery(date: string, sport = 'football'): P
     const key = `${candidate.fixture.toLowerCase()}|${candidate.kickoff}`;
     if (!deduped.has(key)) deduped.set(key, candidate);
   }
+
   const deterministic = [...deduped.values()]
     .filter(isFutureCandidate)
-    .sort((a, b) => new Date(a.kickoff).getTime() - new Date(b.kickoff).getTime())
+    .sort((a, b) => {
+      const ad = getTimeDistance(a.kickoff);
+      const bd = getTimeDistance(b.kickoff);
+      const ai = ad <= IMMINENT_MINUTES * 60_000 ? 0 : 1;
+      const bi = bd <= IMMINENT_MINUTES * 60_000 ? 0 : 1;
+      return ai - bi || ad - bd;
+    })
     .slice(0, Math.max(MAX_SEARCH_RESULTS * 3, 300));
 
+  const imminentCount = deterministic.filter(c => getTimeDistance(c.kickoff) >= 0 && getTimeDistance(c.kickoff) <= IMMINENT_MINUTES * 60_000).length;
   const payload = [
-    `[Broad football discovery date=${date}; localDate=${todayInZone(new Date())}; targetPool=${MAX_SEARCH_RESULTS}; primaryCandidates=${firstKeys.size}; primaryFutureCandidates=${firstFutureKeys.size}; searchCalls=${allSearches.length}; localBrowser=${browser.success ? 'available' : 'failed'}]`,
+    `[Broad football discovery date=${date}; localDate=${localDate}; localDay=${localDay}; localTime=${localTime}; imminentWindow=${imminentUntil.toISOString()}; imminentMinutes=${IMMINENT_MINUTES}; targetPool=${MAX_SEARCH_RESULTS}; primaryCandidates=${firstKeys.size}; primaryFutureCandidates=${firstFutureKeys.size}; searchCalls=${allSearches.length}; imminentCandidates=${imminentCount}; localBrowser=${browser.success ? 'available' : 'failed'}]`,
+    '=== LEAGUE SEARCH CATALOG ===',
+    LEAGUE_SEARCH_CATALOG.join(' | '),
     '=== DETERMINISTIC FUTURE FIXTURE CANDIDATES ===',
-    'These candidates have a kickoff at or after the current time and are eligible for downstream identity/date verification.',
+    'Every candidate below has an explicit kickoff timestamp and is still future at discovery time. Imminent candidates are prioritized first.',
     serializeFixtureCandidates(deterministic),
     ...parts,
   ].join('\n\n');
 
-  return { success: true, data: payload.slice(0, 120000), source: 'broad_fixture_discovery' };
+  return { success: true, data: payload.slice(0, 150000), source: 'broad_fixture_discovery' };
 }
