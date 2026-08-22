@@ -280,7 +280,7 @@ Write FINAL_ANSWER with the primary bet block first, followed by alternatives an
         recommendedOdds: selectionOdds ?? 0,
       },
       savedAt: Date.now(),
-      version: 5,
+      version: 4,
     });
 
     return {
@@ -297,7 +297,7 @@ Write FINAL_ANSWER with the primary bet block first, followed by alternatives an
       recommendedStake: scored.recommendedStake,
       recommendedOdds: selectionOdds ?? 0,
       confidence: Math.round(scored.dataCompletenessScore),
-      goalStatement: `${fixture} — ${market} — ${(trueProb * 100).toFixed(1)}% target probability; final decision is selected across all researched markets`,
+      goalStatement: `${fixture} — ${market} — ${trueProb === 0 ? '' : `${(trueProb * 100).toFixed(1)}%`} target probability; final decision is selected across all researched markets`,
       categoryProbabilities: scored.categoryProbabilities,
     };
   } catch (error) {
@@ -318,7 +318,7 @@ Write FINAL_ANSWER with the primary bet block first, followed by alternatives an
       recommendedStake: scored.recommendedStake,
       recommendedOdds: selectionOdds ?? 0,
       confidence: Math.round(scored.dataCompletenessScore),
-      goalStatement: `${fixture} — ${market} — deterministic prediction retained`,
+      goalStatement: `${fixture} — ${market} — ${calibration}`,
       categoryProbabilities: scored.categoryProbabilities,
       error: message,
     };
