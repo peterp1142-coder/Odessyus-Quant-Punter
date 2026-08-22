@@ -27,6 +27,16 @@ const INITIAL_DELAY_HOURS = 2;
 const MAX_RETRY_HOURS = 6;
 
 async function ensurePredictionSelectionColumn(): Promise<void> {
+  const rows = await query<Array<{ column_exists: number }>>(`
+    SELECT COUNT(*) AS column_exists
+    FROM information_schema.columns
+    WHERE table_schema = DATABASE()
+      AND table_name = 'predictions'
+      AND column_name = 'prediction_selection'
+  `);
+
+  if (Number(rows[0]?.column_exists || 0) > 0) return;
+
   try {
     await query(`ALTER TABLE predictions ADD COLUMN prediction_selection VARCHAR(500) NULL`);
   } catch (err) {
