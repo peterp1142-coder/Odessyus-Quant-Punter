@@ -3,8 +3,8 @@ import type { SubAgentResult } from './subagents/base.js';
 export interface FixtureTask { agentName:string; fixture:string; tier:number; run:()=>Promise<SubAgentResult>; }
 interface QueueItem extends FixtureTask { resolve:(value:SubAgentResult)=>void; reject:(reason:unknown)=>void; queuedAt:number; }
 
-const MAX_QUEUE_WAIT_MS = Math.max(15_000, Number(process.env.AGENT_MAX_QUEUE_WAIT_MS || 60_000));
-const MAX_QUEUE_DEPTH = Math.max(2, Number(process.env.AGENT_MAX_QUEUE_DEPTH || 12));
+const MAX_QUEUE_WAIT_MS = Math.max(15_000, Number(process.env.AGENT_MAX_QUEUE_WAIT_MS || 120_000));
+const MAX_QUEUE_DEPTH = Math.max(100, Number(process.env.AGENT_MAX_QUEUE_DEPTH || 150));
 
 function cleanFixtureLabel(value:string):string {
   const raw=value.replace(/\[[^\]]*\]\((https?:\/\/[^)]+)\)/g,'$1').replace(/\s+/g,' ').trim();
@@ -43,14 +43,14 @@ export class FixtureTaskScheduler {
 }
 
 export const fixtureScheduler=new FixtureTaskScheduler(1);
-fixtureScheduler.setConcurrency('OddsScout',Number(process.env.AGENT_ODDS_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('FormScout',Number(process.env.AGENT_FORM_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('InjuryIntel',Number(process.env.AGENT_INJURY_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('SentimentAgent',Number(process.env.AGENT_SENTIMENT_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('LineupScout',Number(process.env.AGENT_LINEUP_CONCURRENCY||1));
-fixtureScheduler.setConcurrency('RefereeScout',Number(process.env.AGENT_REFEREE_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('TacticalScout',Number(process.env.AGENT_TACTICAL_CONCURRENCY||1));
-fixtureScheduler.setConcurrency('DataQualityScout',Number(process.env.AGENT_DATAQUALITY_CONCURRENCY||1));
-fixtureScheduler.setConcurrency('MarketMicrostructureScout',Number(process.env.AGENT_MICROSTRUCTURE_CONCURRENCY||2));
-fixtureScheduler.setConcurrency('ModelRiskScout',Number(process.env.AGENT_MODELRISK_CONCURRENCY||1));
-fixtureScheduler.setConcurrency('PortfolioRiskScout',Number(process.env.AGENT_PORTFOLIO_CONCURRENCY||1));
+fixtureScheduler.setConcurrency('OddsScout',Number(process.env.AGENT_ODDS_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('FormScout',Number(process.env.AGENT_FORM_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('InjuryIntel',Number(process.env.AGENT_INJURY_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('SentimentAgent',Number(process.env.AGENT_SENTIMENT_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('LineupScout',Number(process.env.AGENT_LINEUP_CONCURRENCY||2));
+fixtureScheduler.setConcurrency('RefereeScout',Number(process.env.AGENT_REFEREE_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('TacticalScout',Number(process.env.AGENT_TACTICAL_CONCURRENCY||2));
+fixtureScheduler.setConcurrency('DataQualityScout',Number(process.env.AGENT_DATAQUALITY_CONCURRENCY||2));
+fixtureScheduler.setConcurrency('MarketMicrostructureScout',Number(process.env.AGENT_MICROSTRUCTURE_CONCURRENCY||4));
+fixtureScheduler.setConcurrency('ModelRiskScout',Number(process.env.AGENT_MODELRISK_CONCURRENCY||2));
+fixtureScheduler.setConcurrency('PortfolioRiskScout',Number(process.env.AGENT_PORTFOLIO_CONCURRENCY||2));
