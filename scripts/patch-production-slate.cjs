@@ -89,22 +89,20 @@ patch(settlement, source => {
   for (const q of searchQueries) {
     const result = await serpSearch(q);
     if (!result.success || !result.data) continue;
-    const text = result.data;
-    const scorePatterns = [
-      new RegExp(`${home.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')}\\s+(\\d+)\\s*[-:]\\s*(\\d+)\\s+${away.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')}`, 'i'),
-      /(\\d+)\\s*[-:]\\s*(\\d+)/,
-    ];
-    for (const pattern of scorePatterns) {
-      const match=text.match(pattern); if(match){return {homeScore:Number(match[1]),awayScore:Number(match[2]),status:'FT',found:true};}
-    }
+    const text = result.data.toLowerCase();
+    const teamsPresent = text.includes(homeNorm) && text.includes(awayNorm);
+    if (!teamsPresent) continue;
+    const match = result.data.match(/\\b(\\d+)\\s*[-:]\\s*(\\d+)\\b/);
+    if (match) return {homeScore:Number(match[1]),awayScore:Number(match[2]),status:'FT',found:true};
   }
 
   const live = await allSportsLivescore();
   if (live.success && live.data) {
     for (const line of live.data.split('\\n')) {
-      const lower=line.toLowerCase();
-      if ((lower.includes(homeNorm) || lower.includes(home.toLowerCase())) && (lower.includes(awayNorm) || lower.includes(away.toLowerCase()))) {
-        const m=line.match(/(\\d+)\\s*[-:]\\s*(\\d+)/); if(m)return {homeScore:Number(m[1]),awayScore:Number(m[2]),status:'FT',found:true};
+      const lower=norm(line);
+      if (lower.includes(homeNorm) && lower.includes(awayNorm)) {
+        const m=line.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
+        if(m)return {homeScore:Number(m[1]),awayScore:Number(m[2]),status:'FT',found:true};
       }
     }
   }
