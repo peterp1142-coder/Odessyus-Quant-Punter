@@ -42,7 +42,10 @@ patch(orchestrator, source => {
   const out:DiscoveredFixture[]=[];
   const buckets=[...grouped.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
   let cursor=0;
-  while(out.length<MAX_DISCOVERY_FIXTURES && buckets.some(([,items])=>items.length)){for(const [,items] of buckets){if(out.length>=MAX_DISCOVERY_FIXTURES)break;const item=items.shift();if(item)out.push(item);}cursor++;if(cursor>MAX_DISCOVERY_FIXTURES)break;}
+  while(out.length<MAX_DISCOVERY_FIXTURES && buckets.some(([,items])=>items.length)){
+    for(const [,items] of buckets){if(out.length>=MAX_DISCOVERY_FIXTURES)break;const item=items.shift();if(item)out.push(item);}
+    cursor++;if(cursor>MAX_DISCOVERY_FIXTURES)break;
+  }
   return out;
 }`);
   }
@@ -56,16 +59,58 @@ patch(scheduler, source => source.replace(
 
 patch(tools, source => {
   if (source.includes('export async function allSportsFinalScores')) return source;
-  return `${source}\n\nexport async function allSportsFinalScores(dateFrom: string, dateTo = dateFrom): Promise<ToolResult> {\n  const pool = keyPool('ALL_SPORTS_APIs');\n  if (!pool.length) return { success:false, data:'', error:'No ALL_SPORTS_APIs keys configured', source:'allsports_final_scores' };\n  for (let i=0;i<pool.length;i++) {\n    const key=pool[allSportsIdx++%pool.length];\n    try {\n      const p=new URLSearchParams({met:'Fixtures',APIkey:key,from:dateFrom,to:dateTo});\n      const r=await fetchWithTimeout(\`${ALLSPORTS_URL}?\${p}\`,{headers:{Accept:'application/json'}},SEARCH_TIMEOUT);\n      if(!r.ok) continue;\n      const j=await r.json() as any;\n      if(!j.success || !Array.isArray(j.result)) continue;\n      const lines=j.result.map((e:any)=>{\n        const hs=e.event_home_team_score ?? e.event_home_final_score ?? e.event_home_team_ft_score;\n        const as=e.event_away_team_score ?? e.event_away_final_score ?? e.event_away_team_ft_score;\n        return [e.event_date,e.event_time||'',e.event_home_team,e.event_away_team,hs ?? '',as ?? '',e.event_status||'',e.event_league_name||e.league_name||''].join(' | ');\n      });\n      return {success:true,data:truncate(lines.join('\\n'),12000),source:'allsports_final_scores'};\n    } catch {}\n  }\n  return {success:false,data:'',error:'All AllSports final-score requests failed',source:'allsports_final_scores'};\n}\n`;
+  return `${source}\n\nexport async function allSportsFinalScores(dateFrom: string, dateTo = dateFrom): Promise<ToolResult> {
+  const pool = keyPool('ALL_SPORTS_APIs');
+  if (!pool.length) return { success:false, data:'', error:'No ALL_SPORTS_APIs keys configured', source:'allsports_final_scores' };
+  for (let i=0;i<pool.length;i++) {
+    const key=pool[allSportsIdx++%pool.length];
+    try {
+      const p=new URLSearchParams({met:'Fixtures',APIkey:key,from:dateFrom,to:dateTo});
+      const r=await fetchWithTimeout(`${ALLSPORTS_URL}?${p}`,{headers:{Accept:'application/json'}},SEARCH_TIMEOUT);
+      if(!r.ok) continue;
+      const j=await r.json() as any;
+      if(!j.success || !Array.isArray(j.result)) continue;
+      const lines=j.result.map((e:any)=>{
+        const hs=e.event_home_final_score ?? e.event_home_team_score ?? e.event_home_team_ft_score;
+        const as=e.event_away_final_score ?? e.event_away_team_score ?? e.event_away_team_ft_score;
+        return [e.event_date,e.event_time||'',e.event_home_team,e.event_away_team,hs ?? '',as ?? '',e.event_status||'',e.event_league_name||e.league_name||''].join(' | ');
+      });
+      return {success:true,data:truncate(lines.join('\\n'),12000),source:'allsports_final_scores'};
+    } catch {}
+  }
+  return {success:false,data:'',error:'All AllSports final-score requests failed',source:'allsports_final_scores'};
+}
+`;
 }, 'finished-score AllSports feed');
 
 patch(settlement, source => {
   let next = source;
   next = next.replace("import { allSportsLivescore } from './tools.js';", "import { allSportsLivescore, allSportsFinalScores, serpSearch } from './tools.js';");
+  next = next.replace(
+    /interface PendingPick \{[\s\S]*?created_at: Date;\n\}/,
+    `interface PendingPick {
+  id: string;
+  fixture: string;
+  prediction_market: string;
+  prediction_selection: string | null;
+  event_date: Date | null;
+  recommended_odds: number | null;
+  created_at: Date;
+}`
+  );
+  next = next.replace(
+    /SELECT id, fixture, prediction_market, event_date, recommended_odds, created_at/,
+    'SELECT id, fixture, prediction_market, prediction_selection, event_date, recommended_odds, created_at'
+  );
   next = next.replace("const score = await fetchScore(pick.fixture);", "const score = await fetchScore(pick.fixture, pick.event_date);");
-  next = next.replace(/async function fetchScore\(fixture: string\): Promise<ScoreResult> \{[\s\S]*?\n\}\n\ninterface SettlementResult/, `async function fetchScore(fixture: string, eventDate: Date | null): Promise<ScoreResult> {
-  const home = fixture.split(/\\s+(?:vs\\.?|v\\.?)\\s+/i)[0]?.trim() || '';
-  const away = fixture.split(/\\s+(?:vs\\.?|v\\.?)\\s+/i)[1]?.trim() || '';
+  next = next.replace(
+    /const settlement = settleMarket\(pick\.prediction_market, score\.homeScore, score\.awayScore\);/,
+    "const settlement = settleMarket(pick.prediction_market, pick.prediction_selection, score.homeScore, score.awayScore);"
+  );
+  next = next.replace(
+    /async function fetchScore\(fixture: string\): Promise<ScoreResult> \{[\s\S]*?\n\}\n\ninterface SettlementResult/,
+    `async function fetchScore(fixture: string, eventDate: Date | null): Promise<ScoreResult> {
+  const [home, away] = fixture.split(/\\s+(?:vs\\.?|v\\.?)\\s+/i).map(s => s?.trim() || '');
   const targetDate = eventDate ? new Date(eventDate).toISOString().slice(0,10) : new Date().toISOString().slice(0,10);
   const norm = (s:string) => s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const homeNorm = norm(home), awayNorm = norm(away);
@@ -82,17 +127,13 @@ patch(settlement, source => {
     }
   }
 
-  const searchQueries = [
+  for (const q of [
     `"${home}" "${away}" ${targetDate} final score`,
     `${home} vs ${away} ${targetDate} result`,
-  ];
-  for (const q of searchQueries) {
+  ]) {
     const result = await serpSearch(q);
     if (!result.success || !result.data) continue;
-    const text = result.data.toLowerCase();
-    const teamsPresent = text.includes(homeNorm) && text.includes(awayNorm);
-    if (!teamsPresent) continue;
-    const match = result.data.match(/\\b(\\d+)\\s*[-:]\\s*(\\d+)\\b/);
+    const match = result.data.match(/(?:^|\\b)(\\d+)\\s*[-:]\\s*(\\d+)(?:\\b|$)/);
     if (match) return {homeScore:Number(match[1]),awayScore:Number(match[2]),status:'FT',found:true};
   }
 
@@ -100,7 +141,7 @@ patch(settlement, source => {
   if (live.success && live.data) {
     for (const line of live.data.split('\\n')) {
       const lower=norm(line);
-      if (lower.includes(homeNorm) && lower.includes(awayNorm)) {
+      if ((lower.includes(homeNorm) || lower.includes(norm(home))) && (lower.includes(awayNorm) || lower.includes(norm(away)))) {
         const m=line.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
         if(m)return {homeScore:Number(m[1]),awayScore:Number(m[2]),status:'FT',found:true};
       }
@@ -109,9 +150,32 @@ patch(settlement, source => {
   return {homeScore:-1,awayScore:-1,status:'',found:false};
 }
 
-interface SettlementResult`);
-  next = next.replace("cron.schedule('*/30 * * * *', async () => {", "setTimeout(() => { void runSettlementPass().catch(err => console.error('[Settlement] Startup pass error:', err instanceof Error ? err.message : String(err))); }, 60_000);\n\n  cron.schedule('*/30 * * * *', async () => {");
-  next = next.replace("LIMIT 50", "LIMIT 500");
-  next = next.replace("console.log('[Settlement] Cron job scheduled (every 30 min)');", "console.log('[Settlement] Cron job scheduled (every 30 min) | startup pass in 60s');");
+interface SettlementResult`
+  );
+  next = next.replace("function settleMarket(market: string, home: number, away: number): SettlementResult {", "function settleMarket(market: string, selection: string | null, home: number, away: number): SettlementResult {");
+  next = next.replace("  const m = market.toLowerCase();", "  const m = market.toLowerCase();\n  const s = String(selection || '').toLowerCase().trim();\n  if (!s) return { outcome: 'manual_review', actualOutcome: 'missing_selection', voidReason: `Missing selection for market: ${market}`, roi: 0 };");
+  next = next.replace(
+    "  if (m.includes('home win') || (m.includes('match result') && m.includes('home')) || m === '1x2') {",
+    "  if (m.includes('home win') || (m.includes('match result') && s.includes('home'))) {"
+  );
+  next = next.replace(
+    "  if (m.includes('away win') || (m.includes('match result') && m.includes('away'))) {",
+    "  if (m.includes('away win') || (m.includes('match result') && s.includes('away'))) {"
+  );
+  next = next.replace("  if (m.includes('draw')) {", "  if (m.includes('draw') && (s === 'draw' || s.includes('draw'))) {");
+  next = next.replace("  if (m.includes('dnb') && m.includes('home')) {", "  if (m.includes('dnb') && (m.includes('home') || s.includes('home'))) {");
+  next = next.replace("  if (m.includes('dnb') && m.includes('away')) {", "  if (m.includes('dnb') && (m.includes('away') || s.includes('away'))) {");
+  next = next.replace("  if (m.includes('btts') || m.includes('both teams')) {", "  if (m.includes('btts') || m.includes('both teams')) {");
+  next = next.replace("    if (m.includes('yes') && bttsYes)", "    if ((s.includes('yes') || m.includes('yes')) && bttsYes)");
+  next = next.replace("    if (m.includes('no') && bttsNo)", "    if ((s.includes('no') || m.includes('no')) && bttsNo)");
+  next = next.replace("  if (m.includes('over 2.5') || m.includes('over2.5') || (m.includes('over') && m.includes('2.5'))) {", "  if (m.includes('over 2.5') || m.includes('over2.5') || (m.includes('over') && m.includes('2.5')) || s.includes('over 2.5')) {");
+  next = next.replace("  if (m.includes('under 2.5') || m.includes('under2.5') || (m.includes('under') && m.includes('2.5'))) {", "  if (m.includes('under 2.5') || m.includes('under2.5') || (m.includes('under') && m.includes('2.5')) || s.includes('under 2.5')) {");
+  next = next.replace("  if (m.includes('over 3.5') || m.includes('over3.5')) {", "  if (m.includes('over 3.5') || m.includes('over3.5') || s.includes('over 3.5')) {");
+  next = next.replace("  if (m.includes('under 3.5') || m.includes('under3.5')) {", "  if (m.includes('under 3.5') || m.includes('under3.5') || s.includes('under 3.5')) {");
+  next = next.replace("  if (m.includes('asian') || m.includes(' ah ') || m.includes('ah ')) {\n    return settleAsianHandicap(market, home, away);\n  }", "  if (m.includes('asian') || m.includes(' ah ') || m.includes('ah ') || s.includes(' +') || s.includes(' -')) {\n    return settleAsianHandicap(`${market} ${selection || ''}`, home, away);\n  }");
+  next = next.replace("  if (m.includes('double chance') || m.includes('1x') || m.includes('x2') || m.includes('12')) {", "  if (m.includes('double chance') || m.includes('1x') || m.includes('x2') || m.includes('12') || s === '1x' || s === 'x2' || s === '12') {");
+  next = next.replace("if (m.includes('1x') || (m.includes('home') && m.includes('draw'))) {", "if (m.includes('1x') || s === '1x' || (m.includes('home') && m.includes('draw'))) {");
+  next = next.replace("if (m.includes('x2') || (m.includes('away') && m.includes('draw'))) {", "if (m.includes('x2') || s === 'x2' || (m.includes('away') && m.includes('draw'))) {");
+  next = next.replace("if (m.includes('12') || m.includes('home or away')) {", "if (m.includes('12') || s === '12' || m.includes('home or away')) {");
   return next;
-}, 'final-score settlement with startup pass and larger batch');
+}, 'exact market + selection settlement, no implicit 1X2 fallback');
