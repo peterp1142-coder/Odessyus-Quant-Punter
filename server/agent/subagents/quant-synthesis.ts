@@ -8,51 +8,292 @@ import { score, calcKelly } from '../scorer.js';
 import { extractFeatures } from '../feature-extractor.js';
 import { getCalibrationStatus } from '../calibration.js';
 
-export interface QuantResult{finalAnswer:string;steps:ReActStep[];success:boolean;error?:string;monteCarlo:{home:number;draw:number;away:number;stdDev:number};trueProb:number;impliedProb:number;expectedValue:number;starRating:number;dataCompletenessScore:number;isValueBet:boolean;recommendedStake:string;recommendedOdds:number;confidence:number;goalStatement:string;categoryProbabilities:{market:number;form:number;injury:number;sentiment:number;tactical:number};}
-const emptyMC={home:0,draw:0,away:0,stdDev:0};
-
-function extractJsonBlock(raw:string):any|null{const fenced=raw.match(/```json\s*([\s\S]*?)\s*```/i)?.[1];if(fenced){try{return JSON.parse(fenced);}catch{}}const start=raw.indexOf('{');if(start>=0){let d=0,s=false,e=false;for(let i=start;i<raw.length;i++){const c=raw[i];if(s){if(e)e=false;else if(c==='\\')e=true;else if(c==='"')s=false;continue;}if(c==='"'){s=true;continue;}if(c==='{')d++;if(c==='}')if(--d===0){try{return JSON.parse(raw.slice(start,i+1));}catch{return null;}}}}return null;}
-function extractCandidateMarkets(raw:string){const parsed=extractJsonBlock(raw);const picks=Array.isArray(parsed?.picks)?parsed.picks:Array.isArray(parsed?.markets)?parsed.markets:[];return picks.map((p:any)=>({market:String(p.market||p.selection||''),odds:p.odds??p.price??p.decimalOdds??null,fixture:String(p.fixture??p.match??''),reason:String(p.reason??p.rationale??'')})).filter((p:any)=>p.market);}
-function fixtureBlock(raw:string,fixture:string){if(!raw)return '';const parts=raw.split(/(?=^===\s*[^=].*===\s*$)/m);const target=parts.find((p:string)=>p.toLowerCase().includes(fixture.toLowerCase()));return target?target.slice(0,9000):raw.slice(0,9000);}
-function statusLabel(market:string){const c=getCalibrationStatus(market);if(!c)return 'UNCALIBRATED';if(c.samples<50)return `WARMING (${c.samples} samples)`;return c.edgeValidated?'VALIDATED':'CALIBRATED / NOT VALIDATED';}
-
-async function scoreCurrentMarket(market:string,targetOdds:number|undefined,fixture:string,evidence:{odds:string;form:string;injury:string;sentiment:string;lineup:string;advanced:string}){
-  const features=await extractFeatures({formText:evidence.form,oddsText:evidence.odds,injuryText:[evidence.injury,evidence.lineup].filter(Boolean).join('\n=== LINEUP ===\n'),sentimentText:evidence.sentiment,advancedText:evidence.advanced,fixture,market});
-  if(!features.evidenceReady)return{market,fixture,available:false,reason:'Current evidence gate failed',status:statusLabel(market)};
-  const injuryAdjustHome=Math.min(.5,(features.injury.injuryIndexHome/10)*.4+((features.injury.absentPlayerRatingHome??0)/10)*.1);
-  const injuryAdjustAway=Math.min(.5,(features.injury.injuryIndexAway/10)*.4+((features.injury.absentPlayerRatingAway??0)/10)*.1);
-  const mc=runMonteCarlo({xgHome:features.form.xgHome,xgAway:features.form.xgAway,homeAdvantage:.15,dixonColesRho:-.1,injuryAdjustHome,injuryAdjustAway});
-  const scored=score({market,mcResult:mc,marketSignals:features.market,formSignals:features.form,injurySignals:features.injury,sentimentSignals:features.sentiment,advancedSignals:features.advanced,targetOdds});
-  const cal=getCalibrationStatus(market);
-  return{market,fixture,available:true,odds:targetOdds??features.market.selectionOdds??null,probability:scored.finalProbability,impliedProbability:features.market.selectionImpliedProb??(targetOdds&&targetOdds>1?1/targetOdds:null),ev:scored.expectedValue,evPct:scored.expectedValuePct,stars:scored.starRating,data:scored.dataCompletenessScore,isValueBet:scored.isValueBet,stake:scored.recommendedStake,status:cal?(cal.edgeValidated?'VALIDATED':cal.samples>=50?'CALIBRATED / NOT VALIDATED':`WARMING (${cal.samples} samples)`):'UNCALIBRATED',calibrationNote:scored.calibrationNote,gateReason:scored.gateFailReason};
+export interface QuantResult {
+  finalAnswer: string;
+  steps: ReActStep[];
+  success: boolean;
+  error?: string;
+  monteCarlo: { home: number; draw: number; away: number; stdDev: number };
+  trueProb: number;
+  impliedProb: number;
+  expectedValue: number;
+  starRating: number;
+  dataCompletenessScore: number;
+  isValueBet: boolean;
+  recommendedStake: string;
+  recommendedOdds: number;
+  confidence: number;
+  goalStatement: string;
+  categoryProbabilities: { market: number; form: number; injury: number; sentiment: number; tactical: number };
 }
 
-async function synthesiseMultiFixture(args:any):Promise<QuantResult>{
-  const{userQuery,sport,oddsResult,formResult,injuryResult,sentimentResult,lineupResult,advancedText,discoveredFixtures,emit,steps}=args;
-  emit({type:'status',content:`Analyzing current evidence across ${discoveredFixtures.length} fixture models and all returned exact-market candidates…`});
-  const candidates=extractCandidateMarkets(oddsResult.rawOutput||'');
-  const unique=new Map<string,any>();
-  for(const c of candidates){const fx=c.fixture||discoveredFixtures.find((x:string)=>String((c as any).market).toLowerCase().includes(x.toLowerCase().split(' vs ')[0]));const key=`${fx||'unknown'}|${c.market.toLowerCase()}`;if(!unique.has(key))unique.set(key,{...c,fixture:fx||c.fixture||discoveredFixtures[0]||''});}
-  const analysis=[] as any[];
-  for(const c of Array.from(unique.values()).slice(0,40)){
-    const fx=c.fixture||discoveredFixtures[0]||'';
-    emit({type:'status',content:`📊 Scoring current evidence: ${c.market}${fx?` · ${fx}`:''}`});
-    try{
-      analysis.push(await scoreCurrentMarket(c.market,typeof c.odds==='number'?c.odds:undefined,fx,{odds:fixtureBlock(oddsResult.rawOutput||'',fx),form:fixtureBlock(formResult.rawOutput||'',fx),injury:fixtureBlock(injuryResult.rawOutput||'',fx),sentiment:fixtureBlock(sentimentResult.rawOutput||'',fx),lineup:fixtureBlock(lineupResult?.rawOutput||'',fx),advanced:advancedText.slice(0,5000)}));
-    }catch(e){analysis.push({market:c.market,fixture:fx,available:false,reason:e instanceof Error?e.message:String(e),status:statusLabel(c.market)});}
+const emptyMC = { home: 0, draw: 0, away: 0, stdDev: 0 };
+
+function statusLabel(market: string): string {
+  const c = getCalibrationStatus(market);
+  if (!c) return 'UNVALIDATED';
+  if (c.samples < 50) return `WARMING (${c.samples} samples)`;
+  return c.edgeValidated ? 'VALIDATED' : 'CALIBRATED / NOT VALIDATED';
+}
+
+function evidenceText(result?: SubAgentResult): string {
+  if (!result) return '';
+  return result.rawOutput || JSON.stringify(result.data || {});
+}
+
+function buildEvidenceSummary(args: {
+  oddsResult: SubAgentResult;
+  formResult: SubAgentResult;
+  injuryResult: SubAgentResult;
+  sentimentResult: SubAgentResult;
+  lineupResult?: SubAgentResult;
+  advancedText: string;
+}): string {
+  return [
+    '=== ODDS ===', evidenceText(args.oddsResult).slice(0, 4500),
+    '=== FORM ===', evidenceText(args.formResult).slice(0, 4500),
+    '=== INJURY ===', evidenceText(args.injuryResult).slice(0, 3500),
+    '=== SENTIMENT ===', evidenceText(args.sentimentResult).slice(0, 3500),
+    '=== LINEUP ===', evidenceText(args.lineupResult).slice(0, 3500),
+    '=== ADVANCED ===', args.advancedText.slice(0, 4500),
+  ].join('\n');
+}
+
+export async function runQuantSynthesis(opts: {
+  userQuery: string;
+  fixture: string;
+  sport: string;
+  market: string;
+  sessionId?: string;
+  oddsResult: SubAgentResult;
+  formResult: SubAgentResult;
+  injuryResult: SubAgentResult;
+  sentimentResult: SubAgentResult;
+  lineupResult?: SubAgentResult;
+  advancedText?: string;
+  onStep: (step: ReActStep) => void;
+  isMultiFixture?: boolean;
+  discoveredFixtures?: string[];
+}): Promise<QuantResult> {
+  const {
+    userQuery,
+    fixture,
+    sport,
+    market = 'Match Result',
+    sessionId = 'default',
+    oddsResult,
+    formResult,
+    injuryResult,
+    sentimentResult,
+    lineupResult,
+    advancedText = '',
+    onStep,
+  } = opts;
+
+  const steps: ReActStep[] = [];
+  const emit = (step: ReActStep) => {
+    const stamped = { ...step, timestamp: new Date().toISOString() };
+    steps.push(stamped);
+    onStep(stamped);
+  };
+
+  const existing = await loadCheckpoint(sessionId, 'QuantSynthesis');
+  if (existing) await clearCheckpoint(sessionId, 'QuantSynthesis');
+
+  emit({ type: 'status', content: `⚡ QuantSynthesis: scoring ${fixture} from all available evidence…` });
+
+  const lineupText = evidenceText(lineupResult);
+  const features = await extractFeatures({
+    formText: evidenceText(formResult),
+    oddsText: evidenceText(oddsResult),
+    injuryText: [evidenceText(injuryResult), lineupText].filter(Boolean).join('\n=== LINEUP ===\n'),
+    sentimentText: evidenceText(sentimentResult),
+    advancedText,
+    fixture,
+    market,
+  });
+
+  // IMPORTANT: evidenceReady is a quality flag, not a kill switch.
+  // We always score using whatever numeric evidence was successfully extracted.
+  // Missing prices/calibration reduce confidence and prevent value-bet promotion.
+  if (!features.evidenceReady) {
+    emit({
+      type: 'thought',
+      content: `⚠️ Partial evidence for ${fixture}; proceeding with available data. Missing fields reduce confidence and disable validated-edge promotion.`,
+    });
   }
-  const available=analysis.filter(x=>x.available).sort((a,b)=>(Number(b.evPct)||-999)-(Number(a.evPct)||-999));
-  const validated=available.filter(x=>x.status==='VALIDATED'&&x.isValueBet);
-  const currentCandidates=available.slice(0,20).map((x,i)=>`${i+1}. ${x.market} — ${x.fixture||'fixture'}${x.odds?` @ ${Number(x.odds).toFixed(2)}`:''} | current model ${(Number(x.probability)*100).toFixed(1)}% | implied ${x.impliedProbability!=null?(Number(x.impliedProbability)*100).toFixed(1)+'%':'unverified'} | EV ${Number(x.evPct).toFixed(2)}% | data ${x.data}% | calibration ${x.status} | ${x.isValueBet?'VALIDATED EDGE':'RESEARCH / NO VALIDATED EDGE'}`).join('\n');
-  const prompt=`${buildSystemPrompt()}\nCURRENT-MATCH MARKET ANALYSIS — Historical calibration is NOT an admission requirement. Use the supplied current evidence and deterministic scores first. Calibration is only a validation/confidence label. Never invent odds, probabilities, EV or missing evidence.\nUSER:${userQuery}\nSPORT:${sport}\nFIXTURES:${discoveredFixtures.join(' | ')}\nCURRENT MARKET SCORES:\n${currentCandidates||'No exact-market candidates were returned.'}\nRAW CURRENT EVIDENCE:\n${(oddsResult.rawOutput||'').slice(0,4500)}\nFORM:${(formResult.rawOutput||'').slice(0,3000)}\nINJURY:${(injuryResult.rawOutput||'').slice(0,2500)}\nLINEUPS:${(lineupResult?.rawOutput||'').slice(0,2500)}\nADVANCED:${(advancedText||'').slice(0,5000)}\nPORTFOLIO RULES: rank markets by current evidence and deterministic model output; calibration may strengthen or weaken trust but must not suppress analysis; do not call an unvalidated market a validated edge; do not build an accumulator from unvalidated legs. Provide the best current candidates and clearly label validation state.`;
-  try{
-    const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-large-latest',messages:[{role:'system',content:prompt},{role:'user',content:'Produce the current-market analysis and ranked shortlist.'}] as any,temperature:.02,maxTokens:5000}));
-    const content=r.choices?.[0]?.message?.content;
-    if(typeof content!=='string'||!content)throw new Error('Empty multi-fixture synthesis');
-    const validatedSummary=validated.length?`\n\n**Validated value-bet legs:** ${validated.length}`:'\n\n**Validated accumulator:** none — current markets were analyzed, but no leg has sufficient historical validation for real-money promotion.';
-    return{finalAnswer:(content.includes('FINAL_ANSWER:')?content.slice(content.indexOf('FINAL_ANSWER:')+13).trim():content)+validatedSummary,steps,success:true,monteCarlo:emptyMC,trueProb:0,impliedProb:0,expectedValue:0,starRating:0,dataCompletenessScore:available.length?Math.round(available.reduce((s,x)=>s+Number(x.data||0),0)/available.length):0,isValueBet:validated.length>0,recommendedStake:validated.length?'SEE VALIDATED SHORTLIST':'SKIP',recommendedOdds:validated.length?Number(validated[0].odds||0):0,confidence:available.length?Math.round(available.reduce((s,x)=>s+Number(x.data||0),0)/available.length):0,goalStatement:`Current-market analysis across ${discoveredFixtures.length} fixtures; calibration used as validation only`,categoryProbabilities:{market:0,form:0,injury:0,sentiment:0,tactical:0}};
-  }catch(e){const msg=e instanceof Error?e.message:String(e);return{finalAnswer:`Current-market analysis completed, but synthesis failed: ${msg}\n\n${currentCandidates}`,steps,success:false,error:msg,monteCarlo:emptyMC,trueProb:0,impliedProb:0,expectedValue:0,starRating:0,dataCompletenessScore:available.length?Math.round(available.reduce((s,x)=>s+Number(x.data||0),0)/available.length):0,isValueBet:false,recommendedStake:'SKIP',recommendedOdds:0,confidence:0,goalStatement:'Current evidence analyzed; synthesis failed',categoryProbabilities:{market:0,form:0,injury:0,sentiment:0,tactical:0}};}
-}
 
-export async function runQuantSynthesis(opts:{userQuery:string;fixture:string;sport:string;market:string;sessionId?:string;oddsResult:SubAgentResult;formResult:SubAgentResult;injuryResult:SubAgentResult;sentimentResult:SubAgentResult;lineupResult?:SubAgentResult;advancedText?:string;onStep:(step:ReActStep)=>void;isMultiFixture?:boolean;discoveredFixtures?:string[]}):Promise<QuantResult>{const{userQuery,fixture,sport,market='Match Result',sessionId='default',oddsResult,formResult,injuryResult,sentimentResult,lineupResult,advancedText='',onStep,isMultiFixture=false,discoveredFixtures=[]}=opts;const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};const existing=await loadCheckpoint(sessionId,'QuantSynthesis');if(existing)await clearCheckpoint(sessionId,'QuantSynthesis');if(isMultiFixture&&oddsResult.success&&oddsResult.rawOutput)return synthesiseMultiFixture({userQuery,sport,oddsResult,formResult,injuryResult,lineupResult,advancedText,discoveredFixtures,emit,steps});emit({type:'status',content:'Extracting evidence-backed numeric features…'});const lineupText=lineupResult?.success?(lineupResult.rawOutput||JSON.stringify(lineupResult.data)):'';const features=await extractFeatures({formText:formResult.success?(formResult.rawOutput||JSON.stringify(formResult.data)):'',oddsText:oddsResult.success?(oddsResult.rawOutput||JSON.stringify(oddsResult.data)):'',injuryText:[injuryResult.success?(injuryResult.rawOutput||JSON.stringify(injuryResult.data)):'',lineupText].filter(Boolean).join('\n=== LINEUP ===\n'),sentimentText:sentimentResult.success?(sentimentResult.rawOutput||JSON.stringify(sentimentResult.data)):'',advancedText,fixture,market});if(!features.evidenceReady){const reason='Insufficient exact-market/evidence fields for deterministic model scoring. Missing evidence is not replaced with baseline assumptions.';emit({type:'error',content:`⛔ ${reason}`});return{finalAnswer:`NO QUALIFIED ANALYSIS\n\n${reason}`,steps,success:true,monteCarlo:emptyMC,trueProb:0,impliedProb:0,expectedValue:0,starRating:0,dataCompletenessScore:features.form.formDataQuality*100,isValueBet:false,recommendedStake:'SKIP',recommendedOdds:0,confidence:0,goalStatement:`${fixture} — evidence gate failed`,categoryProbabilities:{market:0,form:0,injury:0,sentiment:0,tactical:0}};}
- const injuryAdjustHome=Math.min(.5,(features.injury.injuryIndexHome/10)*.4+((features.injury.absentPlayerRatingHome??0)/10)*.1),injuryAdjustAway=Math.min(.5,(features.injury.injuryIndexAway/10)*.4+((features.injury.absentPlayerRatingAway??0)/10)*.1);const mc=runMonteCarlo({xgHome:features.form.xgHome,xgAway:features.form.xgAway,homeAdvantage:.15,dixonColesRho:-.1,injuryAdjustHome,injuryAdjustAway});const selectionOdds=features.market.selectionOdds,selectionImplied=features.market.selectionImpliedProb;const scored=score({market,mcResult:mc,marketSignals:features.market,formSignals:features.form,injurySignals:features.injury,sentimentSignals:features.sentiment,advancedSignals:features.advanced,targetOdds:selectionOdds});const trueProb=scored.finalProbability,impliedProb=selectionImplied??(selectionOdds&&selectionOdds>1?1/selectionOdds:0),ev=scored.expectedValue,kelly=calcKelly(trueProb,selectionOdds??0),gate=scored.isValueBet?'PASS':'FAIL';emit({type:'thought',content:`${scored.calibrationNote} | Gate ${gate}`});const prompt=`${buildSystemPrompt()}\nQUANTITATIVE SYNTHESIS — use these deterministic values exactly. TARGET:${market}\nFIXTURE:${fixture}\nODDS:${selectionOdds&&selectionOdds>1?selectionOdds:'UNVERIFIED'}\nIMPLIED:${impliedProb?`${(impliedProb*100).toFixed(1)}%`:'UNVERIFIED'}\nTRUE:${(trueProb*100).toFixed(1)}%\nEV:${(ev*100).toFixed(2)}%\nGATE:${gate} (${scored.gateFailReason||'passed'})\nSTARS:${scored.starRating}/5 | STAKE:${scored.recommendedStake}\nKELLY_HALF:${kelly.halfKelly}%\nDATA:${scored.dataCompletenessScore}%\nMC: Home ${(mc.homeWin*100).toFixed(1)}%, Draw ${(mc.draw*100).toFixed(1)}%, Away ${(mc.awayWin*100).toFixed(1)}%, BTTS ${(mc.btts*100).toFixed(1)}%, O2.5 ${(mc.over25*100).toFixed(1)}%, U2.5 ${(mc.under25*100).toFixed(1)}%\nADVANCED:${advancedText.slice(0,4500)}\nCalibration is a validation layer, not an analysis prerequisite. Write FINAL_ANSWER using these exact numbers. If the gate fails, do not describe the selection as a validated value bet.`;try{const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-large-latest',messages:[{role:'system',content:prompt},{role:'user',content:`Write the prediction for ${fixture}`}] as any,temperature:.03,maxTokens:4200}));const content=r.choices?.[0]?.message?.content;if(typeof content!=='string'||!content)throw new Error('Empty synthesis response');const finalAnswer=content.includes('FINAL_ANSWER:')?content.slice(content.indexOf('FINAL_ANSWER:')+13).trim():content;await saveCheckpoint({sessionId,agentName:'QuantSynthesis',messages:[],iteration:1,steps:[...steps],rawOutput:finalAnswer,accumulatedData:{trueProb,impliedProb,expectedValue:ev,starRating:scored.starRating,dataCompletenessScore:scored.dataCompletenessScore,isValueBet:scored.isValueBet,recommendedStake:scored.recommendedStake,recommendedOdds:selectionOdds??0},savedAt:Date.now(),version:4});return{finalAnswer,steps,success:true,monteCarlo:{home:mc.homeWin,draw:mc.draw,away:mc.awayWin,stdDev:mc.stdDev},trueProb,impliedProb,expectedValue:ev,starRating:scored.starRating,dataCompletenessScore:scored.dataCompletenessScore,isValueBet:scored.isValueBet,recommendedStake:scored.recommendedStake,recommendedOdds:selectionOdds??0,confidence:Math.round(scored.dataCompletenessScore),goalStatement:`${fixture} — ${market} — True ${(trueProb*100).toFixed(1)}% vs implied ${(impliedProb*100).toFixed(1)}%`,categoryProbabilities:scored.categoryProbabilities};}catch(e){const msg=e instanceof Error?e.message:String(e);return{finalAnswer:'',steps,success:false,error:msg,monteCarlo:{home:mc.homeWin,draw:mc.draw,away:mc.awayWin,stdDev:mc.stdDev},trueProb,impliedProb,expectedValue:ev,starRating:scored.starRating,dataCompletenessScore:scored.dataCompletenessScore,isValueBet:false,recommendedStake:'SKIP',recommendedOdds:selectionOdds??0,confidence:0,goalStatement:`${fixture} — ${market}`,categoryProbabilities:scored.categoryProbabilities};}}
+  const injuryAdjustHome = Math.min(
+    0.5,
+    (features.injury.injuryIndexHome / 10) * 0.4 + ((features.injury.absentPlayerRatingHome ?? 0) / 10) * 0.1,
+  );
+  const injuryAdjustAway = Math.min(
+    0.5,
+    (features.injury.injuryIndexAway / 10) * 0.4 + ((features.injury.absentPlayerRatingAway ?? 0) / 10) * 0.1,
+  );
+
+  const mc = runMonteCarlo({
+    xgHome: features.form.xgHome,
+    xgAway: features.form.xgAway,
+    homeAdvantage: 0.15,
+    dixonColesRho: -0.1,
+    injuryAdjustHome,
+    injuryAdjustAway,
+  });
+
+  const selectionOdds = features.market.selectionOdds;
+  const impliedProb = features.market.selectionImpliedProb ?? (selectionOdds && selectionOdds > 1 ? 1 / selectionOdds : 0);
+  const scored = score({
+    market,
+    mcResult: mc,
+    marketSignals: features.market,
+    formSignals: features.form,
+    injurySignals: features.injury,
+    sentimentSignals: features.sentiment,
+    advancedSignals: features.advanced,
+    targetOdds: selectionOdds,
+  });
+
+  const trueProb = scored.finalProbability;
+  const ev = scored.expectedValue;
+  const kelly = calcKelly(trueProb, selectionOdds ?? 0);
+  const calibration = statusLabel(market);
+
+  emit({
+    type: 'thought',
+    content: `📐 ${fixture}: model ${(trueProb * 100).toFixed(1)}% | data ${scored.dataCompletenessScore}% | calibration ${calibration} | odds ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}`,
+  });
+
+  const evidenceSummary = buildEvidenceSummary({
+    oddsResult,
+    formResult,
+    injuryResult,
+    sentimentResult,
+    lineupResult,
+    advancedText,
+  });
+
+  const prompt = `${buildSystemPrompt()}
+
+CURRENT EVIDENCE PREDICTION MODE
+The system MUST produce a prediction for the requested fixture whenever there is usable evidence. Missing calibration, missing exact odds, incomplete form, missing lineup data, or unavailable advanced fields are NOT fatal errors.
+Use the deterministic values below exactly. Do not invent missing evidence.
+
+FIXTURE: ${fixture}
+SPORT: ${sport}
+TARGET MARKET: ${market}
+TRUE PROBABILITY: ${(trueProb * 100).toFixed(1)}%
+IMPLIED PROBABILITY: ${impliedProb > 0 ? `${(impliedProb * 100).toFixed(1)}%` : 'UNVERIFIED'}
+ODDS: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}
+EXPECTED VALUE: ${(ev * 100).toFixed(2)}%
+DATA COMPLETENESS: ${scored.dataCompletenessScore}%
+CONFIDENCE: ${Math.round(scored.dataCompletenessScore)}%
+STARS: ${scored.starRating}/5
+RECOMMENDED STAKE: ${scored.recommendedStake}
+KELLY HALF: ${kelly.halfKelly}%
+CALIBRATION: ${calibration}
+CALIBRATION NOTE: ${scored.calibrationNote}
+VALUE-BET STATUS: ${scored.isValueBet ? 'VALIDATED VALUE BET' : 'NOT A VALIDATED VALUE BET'}
+GATE NOTE: ${scored.gateFailReason || 'No blocking gate'}
+
+MONTE CARLO:
+Home ${(mc.homeWin * 100).toFixed(1)}%
+Draw ${(mc.draw * 100).toFixed(1)}%
+Away ${(mc.awayWin * 100).toFixed(1)}%
+BTTS ${(mc.btts * 100).toFixed(1)}%
+Over 2.5 ${(mc.over25 * 100).toFixed(1)}%
+Under 2.5 ${(mc.under25 * 100).toFixed(1)}%
+
+AVAILABLE RESEARCH:
+${evidenceSummary}
+
+WRITING RULES
+1. Always return a prediction when the fixture is real and some evidence exists.
+2. Clearly distinguish model prediction from validated value-bet status.
+3. Never invent an odds price, calibration sample, lineup, injury or statistic that is absent.
+4. When evidence is sparse, explicitly say the confidence/data completeness is reduced.
+5. Do not output 'NO QUALIFIED ANALYSIS' merely because calibration or exact-market odds are missing.
+6. Use the deterministic probabilities above; do not replace them with guesses.
+
+Write FINAL_ANSWER with the prediction, probability, confidence/data completeness, Monte Carlo summary, available evidence, missing evidence, calibration status, and whether the selection is a validated value bet.`;
+
+  try {
+    const response = await mistralPool.call(c => c.chat.complete({
+      model: 'mistral-large-latest',
+      messages: [
+        { role: 'system', content: prompt },
+        { role: 'user', content: `Produce the prediction for ${fixture}.` },
+      ] as any,
+      temperature: 0.02,
+      maxTokens: 4200,
+    }));
+
+    const content = response.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) throw new Error('Empty synthesis response');
+
+    const finalAnswer = content.includes('FINAL_ANSWER:')
+      ? content.slice(content.indexOf('FINAL_ANSWER:') + 13).trim()
+      : content.trim();
+
+    await saveCheckpoint({
+      sessionId,
+      agentName: 'QuantSynthesis',
+      messages: [],
+      iteration: 1,
+      steps: [...steps],
+      rawOutput: finalAnswer,
+      accumulatedData: {
+        trueProb,
+        impliedProb,
+        expectedValue: ev,
+        starRating: scored.starRating,
+        dataCompletenessScore: scored.dataCompletenessScore,
+        isValueBet: scored.isValueBet,
+        recommendedStake: scored.recommendedStake,
+        recommendedOdds: selectionOdds ?? 0,
+      },
+      savedAt: Date.now(),
+      version: 4,
+    });
+
+    return {
+      finalAnswer,
+      steps,
+      success: true,
+      monteCarlo: { home: mc.homeWin, draw: mc.draw, away: mc.awayWin, stdDev: mc.stdDev },
+      trueProb,
+      impliedProb,
+      expectedValue: ev,
+      starRating: scored.starRating,
+      dataCompletenessScore: scored.dataCompletenessScore,
+      isValueBet: scored.isValueBet,
+      recommendedStake: scored.recommendedStake,
+      recommendedOdds: selectionOdds ?? 0,
+      confidence: Math.round(scored.dataCompletenessScore),
+      goalStatement: `${fixture} — ${market} — ${(trueProb * 100).toFixed(1)}% model probability`,
+      categoryProbabilities: scored.categoryProbabilities,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    emit({ type: 'error', content: `⚠️ Synthesis model failed; deterministic prediction retained: ${message}` });
+
+    return {
+      finalAnswer: `Prediction for ${fixture}\n\nModel probability: ${(trueProb * 100).toFixed(1)}%\nConfidence/data completeness: ${Math.round(scored.dataCompletenessScore)}%\nCalibration: ${calibration}\nOdds: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}\nExpected value: ${(ev * 100).toFixed(2)}%\nValidated value bet: ${scored.isValueBet ? 'YES' : 'NO'}\n\n${scored.gateFailReason || 'Prediction generated from available evidence.'}`,
+      steps,
+      success: true,
+      monteCarlo: { home: mc.homeWin, draw: mc.draw, away: mc.awayWin, stdDev: mc.stdDev },
+      trueProb,
+      impliedProb,
+      expectedValue: ev,
+      starRating: scored.starRating,
+      dataCompletenessScore: scored.dataCompletenessScore,
+      isValueBet: scored.isValueBet,
+      recommendedStake: scored.recommendedStake,
+      recommendedOdds: selectionOdds ?? 0,
+      confidence: Math.round(scored.dataCompletenessScore),
+      goalStatement: `${fixture} — ${market} — ${calibration}`,
+      categoryProbabilities: scored.categoryProbabilities,
+      error: message,
+    };
+  }
+}
