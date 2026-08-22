@@ -35,8 +35,7 @@ async function createTable(baseId: string, name: string, fields: any[]) {
 }
 
 async function ensurePredictionFields(baseId: string, tableId: string, existing: Set<string>) {
-  const desired = PREDICTION_BASE_FIELDS;
-  for (const field of desired) {
+  for (const field of PREDICTION_BASE_FIELDS) {
     if (existing.has(field.name)) continue;
     try { await airtableFetch(`/meta/bases/${baseId}/tables/${tableId}/fields`, { method: 'POST', body: JSON.stringify(field) }); existing.add(field.name); }
     catch (error) { console.warn(`[Airtable] Could not create field ${field.name}:`, error instanceof Error ? error.message : String(error)); }
@@ -50,11 +49,10 @@ export async function initAirtable(): Promise<AirtableInit | null> {
   if (!baseId) { const rows = await query<any[]>('SELECT base_id FROM airtable_registry LIMIT 1'); if (rows.length) baseId = rows[0].base_id; }
   if (!baseId) { console.log('[Airtable] Creating new base...'); baseId = await createBase(); }
 
-  let schema = await airtableFetch(`/meta/bases/${baseId}/tables`);
-  let rawTables: any[] = schema.tables || [];
+  const schema = await airtableFetch(`/meta/bases/${baseId}/tables`);
+  const rawTables: any[] = schema.tables || [];
   if (!rawTables.some(t => t.name === 'Predictions')) { const created = await createTable(baseId, 'Predictions', PREDICTION_BASE_FIELDS); if (created) rawTables.push(created); }
   if (!rawTables.some(t => t.name === 'Results')) { const created = await createTable(baseId, 'Results', RESULT_FIELDS); if (created) rawTables.push(created); }
-  if ((!rawTables.find(t => t.name === 'Predictions')?.fields?.length) || (!rawTables.find(t => t.name === 'Results')?.fields?.length)) schema = await airtableFetch(`/meta/bases/${baseId}/tables/${undefined}`);
 
   const tables: Record<string, string> = {};
   const fields: Record<string, Set<string>> = {};
@@ -75,7 +73,7 @@ function predictionFields(data: any, decision: any, decisionType: string, availa
   const validation = decision?.validation || (data.isValueBet ? 'VALIDATED' : 'UNVERIFIED');
   const status = decision?.status || (data.isValueBet ? 'BET' : 'SKIP');
   const confidence = Number.isFinite(Number(decision?.confidence_pct)) ? Number(decision.confidence_pct) : safeNumber(data.dataCompleteness);
-  const base = { 'Prediction ID': id, Fixture: data.fixture, Sport: data.sport, League: data.league, Market: market, Selection: selection, 'Decision Type': decisionType, 'Validation Status': validation, 'Betting Status': status, 'Kickoff Time': toISO(data.kickoffTime), 'Predicted Prob %': probabilityPct, 'Implied Prob %': odds && odds > 1 ? 100 / odds : safeNumber(data.impliedProb * 100), 'EV %': ev, 'Confidence %': confidence, 'Star Rating': safeNumber(data.starRating), 'Recommended Odds': odds, 'Data Completeness': safeNumber(data.dataCompleteness), 'Is Value Bet': status === 'BET' || data.isValueBet === true, 'Recommended Stake': decisionType === 'PRIMARY_BET' && status === 'BET' ? data.recommendedStake : 'WATCHLIST', 'Market Score': safeNumber(data.categoryProbabilities?.market), 'Form Score': safeNumber(data.categoryProbabilities?.form), 'Injury Score': safeNumber(data.categoryProbabilities?.injury), 'Sentiment Score': safeNumber(data.categoryProbabilities?.sentiment), 'MC Home Win %': safeNumber(data.monteCarlo?.home), 'MC Draw %': safeNumber(data.monteCarlo?.draw), 'MC Away Win %': safeNumber(data.monteCarlo?.away), 'MC Std Dev': safeNumber(data.monteCarlo?.stdDev), 'Is Combo': data.isCombo, 'Combo Leg IDs': data.comboLegIds, 'Goal Statement': decision?.reason || data.goalStatement, 'Created At': new Date().toISOString() };
+  const base: Record<string, any> = { 'Prediction ID': id, Fixture: data.fixture, Sport: data.sport, League: data.league, Market: market, Selection: selection, 'Decision Type': decisionType, 'Validation Status': validation, 'Betting Status': status, 'Kickoff Time': toISO(data.kickoffTime), 'Predicted Prob %': probabilityPct, 'Implied Prob %': odds && odds > 1 ? 100 / odds : safeNumber(data.impliedProb * 100), 'EV %': ev, 'Confidence %': confidence, 'Star Rating': safeNumber(data.starRating), 'Recommended Odds': odds, 'Data Completeness': safeNumber(data.dataCompleteness), 'Is Value Bet': status === 'BET' || data.isValueBet === true, 'Recommended Stake': decisionType === 'PRIMARY_BET' && status === 'BET' ? data.recommendedStake : 'WATCHLIST', 'Market Score': safeNumber(data.categoryProbabilities?.market), 'Form Score': safeNumber(data.categoryProbabilities?.form), 'Injury Score': safeNumber(data.categoryProbabilities?.injury), 'Sentiment Score': safeNumber(data.categoryProbabilities?.sentiment), 'MC Home Win %': safeNumber(data.monteCarlo?.home), 'MC Draw %': safeNumber(data.monteCarlo?.draw), 'MC Away Win %': safeNumber(data.monteCarlo?.away), 'MC Std Dev': safeNumber(data.monteCarlo?.stdDev), 'Is Combo': data.isCombo, 'Combo Leg IDs': data.comboLegIds, 'Goal Statement': decision?.reason || data.goalStatement, 'Created At': new Date().toISOString() };
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(cleanFields(base))) { if (available.has(k) || ['Prediction ID','Fixture','Sport','League','Market','Kickoff Time','Predicted Prob %','Implied Prob %','EV %','Star Rating','Recommended Odds','Data Completeness','Is Value Bet','Recommended Stake','Market Score','Form Score','Injury Score','Sentiment Score','MC Home Win %','MC Draw %','MC Away Win %','MC Std Dev','Is Combo','Combo Leg IDs','Goal Statement','Created At'].includes(k)) out[k] = v; }
   return out;
