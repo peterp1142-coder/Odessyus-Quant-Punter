@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+const fs = require('node:fs');
+const path = require('node:path');
 
 const file = path.resolve('server/agent/subagents/quant-synthesis.ts');
 const source = fs.readFileSync(file, 'utf8');
