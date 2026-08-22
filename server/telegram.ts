@@ -23,6 +23,19 @@ function getStatusFromStep(step: ReActStep): string | null {
   return null;
 }
 
+function asNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
 function formatForTelegram(finalAnswer: string, meta: Record<string, unknown>): string {
   const stars = '⭐'.repeat(Number(meta.starRating) || 0);
   const ev = meta.expectedValue ? `+${(Number(meta.expectedValue) * 100).toFixed(2)}%` : '';
@@ -124,9 +137,23 @@ export function initTelegram(): Telegraf | null {
       );
 
       if (result.success && result.finalAnswer) {
-        const m = result.metadata;
-        const formatted = formatForTelegram(result.finalAnswer, m as Record<string, unknown>);
+        const m = asRecord(result.metadata);
+        const formatted = formatForTelegram(result.finalAnswer, m);
         const MAX = 4000;
+        const recommendedOddsValue = asNumber(m.recommendedOdds);
+        const impliedProbValue = asNumber(m.impliedProb);
+        const probabilityValue = asNumber(m.probability);
+        const confidenceValue = asNumber(m.confidence);
+        const starRatingValue = asNumber(m.starRating);
+        const expectedValueValue = asNumber(m.expectedValue);
+        const dataCompletenessValue = asNumber(m.dataCompletenessScore);
+        const monteCarlo = asRecord(m.monteCarlo);
+        const monteCarloStdDev = asNumber(monteCarlo.stdDev);
+        const monteCarloHome = asNumber(monteCarlo.home);
+        const monteCarloDraw = asNumber(monteCarlo.draw);
+        const monteCarloAway = asNumber(monteCarlo.away);
+        const agentsRun = m.agentsRun;
+        const subagentResults = m.subagentResults;
 
         if (formatted.length <= MAX) {
           await ctx.reply(formatted);
@@ -137,15 +164,16 @@ export function initTelegram(): Telegraf | null {
           }
         }
 
-        // Save prediction — truncate free-text fields to column limits
         const predId        = uuidv4();
         const fixtureStr    = String(m.fixture        || '').slice(0, 490);
         const leagueStr     = String(m.sport          || '').slice(0, 190);
         const marketStr     = String(m.market         || '').slice(0, 190);
         const goalStr       = String(m.goalStatement  || '').slice(0, 490);
-        const recommendedOdds = m.recommendedOdds > 1
-          ? m.recommendedOdds
-          : (m.impliedProb > 0 ? parseFloat((1 / m.impliedProb).toFixed(3)) : null);
+        const recommendedOdds = recommendedOddsValue != null && recommendedOddsValue > 1
+          ? recommendedOddsValue
+          : (impliedProbValue != null && impliedProbValue > 0
+              ? parseFloat((1 / impliedProbValue).toFixed(3))
+              : null);
 
         await query(
           `INSERT INTO predictions
@@ -156,21 +184,20 @@ export function initTelegram(): Telegraf | null {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
           [
             predId, sessionId, fixtureStr, leagueStr, marketStr, goalStr,
-            m.probability, m.confidence, m.starRating,
+            probabilityValue, confidenceValue, starRatingValue,
             recommendedOdds,
-            m.expectedValue, m.dataCompletenessScore ?? null,
+            expectedValueValue, dataCompletenessValue,
             result.finalAnswer,
             JSON.stringify(result.steps),
             JSON.stringify(result.metadata),
-            JSON.stringify({ agentsRun: m.agentsRun, subagentResults: m.subagentResults }),
-            m.monteCarlo.stdDev,
+            JSON.stringify({ agentsRun, subagentResults }),
+            monteCarloStdDev,
           ]
         ).catch(e => console.error('[Telegram] Save prediction:', e));
 
-        // Persist Monte Carlo + market edge into feature_vectors
         try {
-          const impliedProbHome = m.impliedProb ?? null;
-          const trueProb        = m.trueProb   ?? null;
+          const impliedProbHome = impliedProbValue;
+          const trueProb        = asNumber(m.trueProb);
           const valueEdge       = (trueProb != null && impliedProbHome != null)
             ? parseFloat((trueProb - impliedProbHome).toFixed(4)) : null;
           await query(
@@ -181,12 +208,9 @@ export function initTelegram(): Telegraf | null {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               uuidv4(), predId,
-              m.monteCarlo.home   ?? null,
-              m.monteCarlo.draw   ?? null,
-              m.monteCarlo.away   ?? null,
-              m.monteCarlo.stdDev ?? null,
+              monteCarloHome, monteCarloDraw, monteCarloAway, monteCarloStdDev,
               impliedProbHome, trueProb, valueEdge,
-              m.starRating ?? null,
+              starRatingValue,
             ]
           );
         } catch (fvErr) { console.error('[Telegram] Save feature_vectors:', fvErr); }
