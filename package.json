@@ -9,7 +9,7 @@
     "client": "vite --port 5000 --host 0.0.0.0",
     "build": "npm run build:all",
     "build:client": "vite build",
-    "build:server": "node scripts/fix-quant-selection.cjs && node scripts/patch-airtable-schema.cjs && tsc -p tsconfig.server.json",
+    "build:server": "node scripts/fix-quant-selection.cjs && node scripts/patch-airtable-schema.cjs && node scripts/patch-global-fixture-slate.cjs && tsc -p tsconfig.server.json",
     "build:browser": "cd browser && npm install --no-audit --no-fund && PUPPETEER_CACHE_DIR=/opt/render/project/.chrome npx puppeteer browsers install chrome",
     "build:all": "npm run build:client && npm run build:server",
     "preview": "vite preview",
