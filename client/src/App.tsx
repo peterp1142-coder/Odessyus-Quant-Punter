@@ -90,9 +90,16 @@ function formatFplPayload(payload: Record<string, any>): string {
 function App() {
   const [view, setView] = useState<AppView>('chat');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try { return localStorage.getItem('odessyus_sidebar_collapsed') === '1'; } catch { return false; }
+  });
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [fplRetrievable, setFplRetrievable] = useState(false);
   const [retrievingFpl, setRetrievingFpl] = useState(false);
+
+  useEffect(() => {
+    try { localStorage.setItem('odessyus_sidebar_collapsed', sidebarCollapsed ? '1' : '0'); } catch { /* ignore */ }
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     fetch('/api/auth/status', { credentials: 'include' })
@@ -141,9 +148,7 @@ function App() {
       const data = await res.json() as { messages?: Array<{id?:string;role:string;content:string;created_at?:string}> };
       const messages = data.messages || [];
       const fplMessage = [...messages].reverse().find(m => m.role === 'assistant' && parseFplPayload(m.content));
-      if (!fplMessage) {
-        throw new Error('No saved structured FPL result was found for this session.');
-      }
+      if (!fplMessage) throw new Error('No saved structured FPL result was found for this session.');
       const payload = parseFplPayload(fplMessage.content);
       if (!payload) throw new Error('Saved FPL result could not be parsed.');
 
@@ -188,18 +193,13 @@ function App() {
   }, [activeId, updateMessages]);
 
   if (authenticated === null) {
-    return (
-      <div className="fixed inset-0 bg-[#0d0d0d] flex items-center justify-center">
-        <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
+    return <div className="fixed inset-0 bg-[#0d0d0d] flex items-center justify-center"><div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" /></div>;
   }
-
   if (!authenticated) return <AccessGate onAuthenticated={() => setAuthenticated(true)} />;
 
   return (
     <div className="flex h-screen bg-[#0d0d0d] overflow-hidden">
-      <div className="app-sidebar-desktop">
+      <div className={`app-sidebar-desktop ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <Sidebar
           conversations={conversations}
           activeId={activeId}
@@ -208,6 +208,8 @@ function App() {
           onSelectConversation={handleSelectConversation}
           onDeleteConversation={deleteConversation}
           onViewChange={setView}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={() => setSidebarCollapsed(v => !v)}
         />
       </div>
 
@@ -231,7 +233,7 @@ function App() {
       )}
 
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <div className="app-topbar-mobile items-center gap-3 px-4 py-3 border-b border-white/[0.06] bg-[#0d0d0d] flex-shrink-0" style={{borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+        <div className="app-topbar-mobile items-center gap-3 px-4 py-3 border-b border-white/[0.06] bg-[#0d0d0d] flex-shrink-0">
           <button onClick={() => setSidebarOpen(true)} className="text-neutral-400 hover:text-neutral-200 p-1.5 rounded-lg hover:bg-white/[0.06] transition-colors">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" /></svg>
           </button>
@@ -250,24 +252,12 @@ function App() {
             <div className="relative h-full">
               {fplRetrievable && (
                 <div className="absolute top-3 right-4 z-20">
-                  <button
-                    type="button"
-                    onClick={() => void handleRetrieveFpl()}
-                    disabled={retrievingFpl}
-                    className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-60 text-emerald-300 text-xs font-semibold px-3 py-2 shadow-lg backdrop-blur"
-                    title="Retrieve the completed FPL analysis saved for this session without rerunning it"
-                  >
+                  <button type="button" onClick={() => void handleRetrieveFpl()} disabled={retrievingFpl} className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-60 text-emerald-300 text-xs font-semibold px-3 py-2 shadow-lg backdrop-blur" title="Retrieve the completed FPL analysis saved for this session without rerunning it">
                     {retrievingFpl ? 'Retrieving FPL…' : '↻ Retrieve FPL Result'}
                   </button>
                 </div>
               )}
-              <ChatInterface
-                key={activeId}
-                conversationId={activeId}
-                initialMessages={activeConversation?.messages ?? []}
-                onMessagesChange={handleMessagesChange}
-                onNewChat={handleNewChat}
-              />
+              <ChatInterface key={activeId} conversationId={activeId} initialMessages={activeConversation?.messages ?? []} onMessagesChange={handleMessagesChange} onNewChat={handleNewChat} />
             </div>
           ) : view === 'chat' ? (
             <div className="flex items-center justify-center h-full"><div className="w-6 h-6 border border-emerald-500 border-t-transparent rounded-full animate-spin" /></div>
