@@ -23,6 +23,7 @@ type AgentName='OddsScout'|'FormScout'|'InjuryIntel'|'SentimentAgent'|'LineupSco
 interface AgentTask{name:AgentName;focus:string;required:boolean;tier:number;}
 interface AgentPlan{reasoning:string;agents:AgentTask[];}
 interface DiscoveredFixture{fixture:string;kickoff?:string;status?:string;competition?:string;}
+interface SummaryRow{league:string;fixture:string;date:string;pick:string;probability:number;odds:number|null;ev:number;confidence:number;stars:number;status:string;}
 
 const MARKET_TIMEZONE=process.env.MARKET_TIMEZONE||'Africa/Lagos';
 const MAX_DISCOVERY_FIXTURES=Math.max(1,Number(process.env.MAX_DISCOVERY_FIXTURES||20));
@@ -31,11 +32,31 @@ const MAX_FIXTURE_PIPELINES=Math.max(1,Number(process.env.MAX_FIXTURE_PIPELINES|
 function marketToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:MARKET_TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());}
 function fixtureMatchDate(k?:string,fallback=''){if(!k)return fallback;const d=new Date(k);if(Number.isNaN(d.getTime()))return fallback;return new Intl.DateTimeFormat('en-CA',{timeZone:MARKET_TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'}).format(d);}
 function normalizeFixtureName(v:string){return v.toLowerCase().replace(/\s+/g,' ').replace(/\s*(?:vs\.?|v\.?)\s*/g,' vs ').trim();}
+function normalizeLeague(value?:string){
+ const s=String(value||'').replace(/\s+/g,' ').trim();
+ if(!s)return 'UNVERIFIED LEAGUE';
+ const x=s.toLowerCase();
+ if(x.includes('premier league')&&!x.includes('scotland'))return 'PREMIER LEAGUE';
+ if(x.includes('championship')&&x.includes('england'))return 'CHAMPIONSHIP';
+ if(x.includes('serie a'))return 'SERIE A';
+ if(x.includes('serie b'))return 'SERIE B';
+ if(x.includes('la liga')||x.includes('primera división')||x.includes('primera division'))return 'LA LIGA';
+ if(x.includes('bundesliga'))return 'BUNDESLIGA';
+ if(x.includes('ligue 1'))return 'LIGUE 1';
+ if(x.includes('eredivisie'))return 'EREDIVISIE';
+ if(x.includes('primeira liga'))return 'PRIMEIRA LIGA';
+ if(x.includes('champions league'))return 'UEFA CHAMPIONS LEAGUE';
+ if(x.includes('europa league'))return 'UEFA EUROPA LEAGUE';
+ return s.toUpperCase();
+}
 function looksLikeRealFixture(v:string){
  const s=v.replace(/\s+/g,' ').trim();
  if(!/^.{2,70}\s+(?:vs\.?|v\.?)\s+.{2,70}$/i.test(s))return false;
  if(/(?:sky sports|flashscore|follow |live |schedule|fixture|fifa world cup|today's matches|matches taking place|brings you|kick-off|match time|odds by|premier league schedule|espn)/i.test(s))return false;
  if(/\b(?:saturday|sunday|monday|tuesday|wednesday|thursday|friday),?\s+\d{1,2}\s+/i.test(s))return false;
+ if(/\bweek\s*\d+\b.*\bjan\.?\b/i.test(s))return false;
+ if(/^week\s*\d+/i.test(s))return false;
+ if(/\b(?:nfl|nba|mlb|nhl)\b/i.test(s))return false;
  return true;
 }
 function isCompletedStatus(status?:string){const s=String(status||'').toLowerCase();return /finished|final|ended|ft|aet|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s);}
@@ -94,6 +115,8 @@ function priorContext(results:Record<string,SubAgentResult>){return Object.entri
 async function runFixturePipeline(fx:DiscoveredFixture,index:number,plan:AgentPlan,schedule:string,sessionId:string,sport:string,requestedDate:string,onStep:(s:ReActStep)=>void){const matchDate=fixtureMatchDate(fx.kickoff,requestedDate),results:Record<string,SubAgentResult>={};const canonical=canonicalFixtureContext(fx.fixture,sport,matchDate,fx.competition);for(const tier of [1,2,3,4]){const tasks=plan.agents.filter(a=>a.tier===tier);const settled=await Promise.allSettled(tasks.map(t=>dispatchAgent(t,fx.fixture,sport,matchDate,`${sessionId}-${index}-${t.name}`,`${canonical}\n=== DISCOVERY ===\n${schedule.slice(0,5000)}\n${priorContext(results)}`,onStep)));settled.forEach((r,i)=>{if(r.status==='fulfilled')results[tasks[i].name]=r.value;else results[tasks[i].name]={agentName:tasks[i].name,success:false,data:{},steps:[],rawOutput:'',error:String(r.reason)};});}return results;}
 function aggregateOne(name:AgentName,fixture:string,results:Record<string,SubAgentResult>):SubAgentResult{const r=results[name];return r||{agentName:name,success:false,data:{},steps:[],rawOutput:'',error:`No ${name} result for ${fixture}`};}
 function advancedText(results:Record<string,SubAgentResult>){return ['RefereeScout','TacticalScout','MarketMicrostructureScout','ModelRiskScout','DataQualityScout'].map(n=>results[n]?.rawOutput||'').filter(Boolean).join('\n\n');}
+function oneX2Pick(q:any){const mc=q?.monteCarlo||{};const options=[['HOME',Number(mc.home)||0],['DRAW',Number(mc.draw)||0],['AWAY',Number(mc.away)||0]];options.sort((a,b)=>(b[1] as number)-(a[1] as number));return{pick:String(options[0][0]),probability:Number(options[0][1]),all:{home:Number(mc.home)||0,draw:Number(mc.draw)||0,away:Number(mc.away)||0}};}
+function formatSummaryTable(groups:Record<string,SummaryRow[]>){const chunks:string[]=['# FIXTURE & PICKS SUMMARY','Grouped independently by league after all fixture research and synthesis.',''];for(const league of Object.keys(groups).sort()){chunks.push(`## ${league}`, '', '| Fixture | Date | Pick | Model % | Odds | EV | Confidence | Stars | Status |','|---|---|---:|---:|---:|---:|---:|---:|---|');for(const r of groups[league].sort((a,b)=>a.fixture.localeCompare(b.fixture))){const odds=r.odds!=null?r.odds.toFixed(2):'—';const ev=Number.isFinite(r.ev)?`${r.ev>=0?'+':''}${r.ev.toFixed(2)}%`:'—';chunks.push(`| ${r.fixture} | ${r.date} | **${r.pick}** | ${(r.probability*100).toFixed(1)}% | ${odds} | ${ev} | ${r.confidence}% | ${r.stars}/5 | ${r.status} |`);}chunks.push('');}return chunks.join('\n');}
 
 export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(step:ReActStep)=>void):Promise<OrchestratorResult>{
  const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};
@@ -102,13 +125,14 @@ export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(
  else fixtures=[{fixture:parsed.fixture,status:'scheduled'}];
  if(!fixtures.length)return{finalAnswer:`NO QUALIFIED FIXTURES: No clean future fixtures were verified for ${parsed.matchDate}.`,steps,success:true,metadata:{fixture:'',sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:[]}};
  const plan=await buildPlan(fixtures.map(f=>f.fixture).join(' | '));const registry:Record<string,Record<string,SubAgentResult>>={};let next=0;const workers=Array.from({length:Math.min(MAX_FIXTURE_PIPELINES,fixtures.length)},async()=>{while(true){const i=next++;if(i>=fixtures.length)return;registry[fixtures[i].fixture]=await runFixturePipeline(fixtures[i],i,plan,schedule,sessionId,parsed.sport,parsed.matchDate,emit);}});await Promise.all(workers);
- const outputs:string[]=[];const predictions:any[]=[];
+ const outputs:string[]=[];const predictions:any[]=[];const summaryGroups:Record<string,SummaryRow[]>={};
  for(let i=0;i<fixtures.length;i++){
   const fx=fixtures[i],results=registry[fx.fixture]||{},date=fixtureMatchDate(fx.kickoff,parsed.matchDate);emit({type:'status',content:`🧮 Synthesizing ${fx.fixture} independently for ${date}…`});
   const q=await runQuantSynthesis({userQuery,fixture:fx.fixture,sport:parsed.sport,market:parsed.market,sessionId:`${sessionId}-synthesis-${i}`,oddsResult:aggregateOne('OddsScout',fx.fixture,results),formResult:aggregateOne('FormScout',fx.fixture,results),injuryResult:aggregateOne('InjuryIntel',fx.fixture,results),sentimentResult:aggregateOne('SentimentAgent',fx.fixture,results),lineupResult:aggregateOne('LineupScout',fx.fixture,results),advancedText:advancedText(results),onStep:emit,isMultiFixture:false,discoveredFixtures:[fx.fixture]});
-  outputs.push(`## ${fx.fixture}\n**Match date:** ${date}\n\n${q.finalAnswer||'NO QUALIFIED ANALYSIS'}`);predictions.push({fixture:fx.fixture,date,success:q.success,probability:q.trueProb*100,confidence:q.confidence,starRating:q.starRating,expectedValue:q.expectedValue,isValueBet:q.isValueBet});
-  if(q.success)logPrediction({predictionId:`${sessionId}-${i}-${Date.now()}`,fixture:fx.fixture,sport:parsed.sport,market:parsed.market,predictedProb:q.trueProb,impliedProb:q.impliedProb,expectedValue:q.expectedValue,isValueBet:q.isValueBet,starRating:q.starRating});
+  const pick=oneX2Pick(q);const league=normalizeLeague(fx.competition);const row:SummaryRow={league,fixture:fx.fixture,date,pick:pick.pick,probability:pick.probability,odds:q.recommendedOdds>1?q.recommendedOdds:null,ev:q.expectedValue*100,confidence:q.confidence,stars:q.starRating,status:q.isValueBet?'BET':'SKIP'};if(!summaryGroups[league])summaryGroups[league]=[];summaryGroups[league].push(row);
+  outputs.push(`## ${fx.fixture}\n**League:** ${league}\n**Match date:** ${date}\n\n${q.finalAnswer||'NO QUALIFIED ANALYSIS'}`);predictions.push({fixture:fx.fixture,league,date,success:q.success,pick:pick.pick,probability:pick.probability*100,monteCarlo:pick.all,confidence:q.confidence,starRating:q.starRating,expectedValue:q.expectedValue,isValueBet:q.isValueBet});
+  if(q.success)logPrediction({predictionId:`${sessionId}-${i}-${Date.now()}`,fixture:fx.fixture,sport:parsed.sport,market:parsed.market,predictedProb:q.trueProb,impliedProb:q.impliedProb,expectedValue:q.expectedValue,isValueBet:q.isValueBet,starRating:q.starRating,league:fx.competition});
  }
- const finalAnswer=outputs.join('\n\n');emit({type:'synthesis',content:`🏆 Independent synthesis complete for ${outputs.length}/${fixtures.length} verified fixtures.`});
- return{finalAnswer,steps,success:true,metadata:{fixture:fixtures.map(f=>f.fixture).join(' | '),sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:fixtures.map(f=>({fixture:f.fixture,kickoff:f.kickoff,date:fixtureMatchDate(f.kickoff,parsed.matchDate)})),predictions,agentsRun:plan.agents.map(a=>a.name),queueSnapshot:fixtureScheduler.snapshot(),researchCache:researchCacheStats(),fixtureRegistry:Object.fromEntries(Object.entries(registry).map(([fx,r])=>[fx,Object.fromEntries(Object.entries(r).map(([n,v])=>[n,v.success]))])),poolStatus:mistralPool.status()}};
+ const summary=formatSummaryTable(summaryGroups);const finalAnswer=`${summary}\n\n# DETAILED FIXTURE ANALYSIS\n\n${outputs.join('\n\n')}`;emit({type:'synthesis',content:`🏆 Independent synthesis complete for ${outputs.length}/${fixtures.length} verified fixtures; grouped ${Object.keys(summaryGroups).length} leagues.`});
+ return{finalAnswer,steps,success:true,metadata:{fixture:fixtures.map(f=>f.fixture).join(' | '),sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:fixtures.map(f=>({fixture:f.fixture,kickoff:f.kickoff,date:fixtureMatchDate(f.kickoff,parsed.matchDate),league:normalizeLeague(f.competition)})),predictions,summaryByLeague:summaryGroups,agentsRun:plan.agents.map(a=>a.name),queueSnapshot:fixtureScheduler.snapshot(),researchCache:researchCacheStats(),fixtureRegistry:Object.fromEntries(Object.entries(registry).map(([fx,r])=>[fx,Object.fromEntries(Object.entries(r).map(([n,v])=>[n,v.success]))])),poolStatus:mistralPool.status()}};
 }
