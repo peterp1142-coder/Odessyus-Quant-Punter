@@ -113,9 +113,6 @@ export async function runQuantSynthesis(opts: {
     market,
   });
 
-  // IMPORTANT: evidenceReady is a quality flag, not a kill switch.
-  // We always score using whatever numeric evidence was successfully extracted.
-  // Missing prices/calibration reduce confidence and prevent value-bet promotion.
   if (!features.evidenceReady) {
     emit({
       type: 'thought',
@@ -175,26 +172,36 @@ export async function runQuantSynthesis(opts: {
 
   const prompt = `${buildSystemPrompt()}
 
-CURRENT EVIDENCE PREDICTION MODE
-The system MUST produce a prediction for the requested fixture whenever there is usable evidence. Missing calibration, missing exact odds, incomplete form, missing lineup data, or unavailable advanced fields are NOT fatal errors.
-Use the deterministic values below exactly. Do not invent missing evidence.
+CURRENT EVIDENCE PREDICTION + BET SELECTION MODE
+The system MUST produce a prediction for the real fixture whenever there is usable evidence. Missing calibration, missing exact odds, incomplete form, missing lineup data, or unavailable advanced fields are NOT fatal errors.
+After analyzing the supplied evidence, you must make ONE explicit primary betting decision across ALL markets explicitly supported by the evidence. Do not default to 1X2. Compare 1X2, BTTS, totals, DNB, Asian handicap, cards, corners, player props, and other markets only when the evidence actually contains them.
+
+PRIMARY BET SELECTION RULES
+1. The primary decision is the single BEST PLAUSIBLE PICK for this fixture, not the highest raw simulated probability.
+2. Prefer a verified, liquid market with a positive risk-adjusted edge, strong evidence agreement, acceptable data completeness, acceptable model risk, and calibration when available.
+3. A very high model probability by itself is NOT enough. Penalize markets driven by weak/old data, speculative lineups, suspicious odds, missing current prices, or extreme model assumptions.
+4. Never invent odds, probabilities, market names, player props, or calibration data.
+5. A selection may be the PRIMARY BET only when its price is verified and the deterministic betting gates allow a real wager. Otherwise output NO_BET as the primary decision and identify the best watchlist candidate separately.
+6. Do not call an unvalidated market a validated value bet.
+7. If two markets are close, prefer the one with better evidence quality, market liquidity, and lower model risk rather than simply choosing the larger simulated probability.
+8. The primary bet must be one concrete selection, such as 'Man Utd to win', 'Under 2.5 Goals', 'BTTS No', 'Everton +0.5 AH', 'Over 4.5 Cards', or a specific player prop, with the exact verified odds when available.
 
 FIXTURE: ${fixture}
 SPORT: ${sport}
-TARGET MARKET: ${market}
-TRUE PROBABILITY: ${(trueProb * 100).toFixed(1)}%
-IMPLIED PROBABILITY: ${impliedProb > 0 ? `${(impliedProb * 100).toFixed(1)}%` : 'UNVERIFIED'}
-ODDS: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}
-EXPECTED VALUE: ${(ev * 100).toFixed(2)}%
+USER TARGET MARKET: ${market}
+TRUE PROBABILITY FOR TARGET MARKET: ${(trueProb * 100).toFixed(1)}%
+IMPLIED PROBABILITY FOR TARGET MARKET: ${impliedProb > 0 ? `${(impliedProb * 100).toFixed(1)}%` : 'UNVERIFIED'}
+TARGET ODDS: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}
+TARGET EXPECTED VALUE: ${(ev * 100).toFixed(2)}%
 DATA COMPLETENESS: ${scored.dataCompletenessScore}%
 CONFIDENCE: ${Math.round(scored.dataCompletenessScore)}%
 STARS: ${scored.starRating}/5
-RECOMMENDED STAKE: ${scored.recommendedStake}
-KELLY HALF: ${kelly.halfKelly}%
-CALIBRATION: ${calibration}
-CALIBRATION NOTE: ${scored.calibrationNote}
-VALUE-BET STATUS: ${scored.isValueBet ? 'VALIDATED VALUE BET' : 'NOT A VALIDATED VALUE BET'}
-GATE NOTE: ${scored.gateFailReason || 'No blocking gate'}
+TARGET RECOMMENDED STAKE: ${scored.recommendedStake}
+TARGET KELLY HALF: ${kelly.halfKelly}%
+TARGET CALIBRATION: ${calibration}
+TARGET CALIBRATION NOTE: ${scored.calibrationNote}
+TARGET VALUE-BET STATUS: ${scored.isValueBet ? 'VALIDATED VALUE BET' : 'NOT A VALIDATED VALUE BET'}
+TARGET GATE NOTE: ${scored.gateFailReason || 'No blocking gate'}
 
 MONTE CARLO:
 Home ${(mc.homeWin * 100).toFixed(1)}%
@@ -203,29 +210,49 @@ Away ${(mc.awayWin * 100).toFixed(1)}%
 BTTS ${(mc.btts * 100).toFixed(1)}%
 Over 2.5 ${(mc.over25 * 100).toFixed(1)}%
 Under 2.5 ${(mc.under25 * 100).toFixed(1)}%
+Over 3.5 ${(mc.over35 * 100).toFixed(1)}%
+Under 3.5 ${(mc.under35 * 100).toFixed(1)}%
+DNB Home ${(mc.dnbHome * 100).toFixed(1)}%
+DNB Away ${(mc.dnbAway * 100).toFixed(1)}%
+Asian Home +0.5 ${(mc.ahHome05 * 100).toFixed(1)}%
+Asian Away +0.5 ${(mc.ahAway05 * 100).toFixed(1)}%
+Asian Home +1.5 ${(mc.ahHome15 * 100).toFixed(1)}%
+Asian Away +1.5 ${(mc.ahAway15 * 100).toFixed(1)}%
 
 AVAILABLE RESEARCH:
 ${evidenceSummary}
 
+FINAL RESPONSE CONTRACT
+Return the detailed analysis as before, but at the very top include this machine-readable block using ONLY facts you actually established:
+PRIMARY_BET:
+{"status":"BET|NO_BET","market":"...","selection":"...","probability_pct":number|null,"odds":number|null,"ev_pct":number|null,"confidence_pct":number,"reason":"...","validation":"VALIDATED|UNVALIDATED|UNVERIFIED"}
+
+Then include up to 3 alternatives in:
+ALTERNATIVE_PICKS:
+[{"market":"...","selection":"...","probability_pct":number|null,"odds":number|null,"ev_pct":number|null,"status":"CONSIDER|SKIP|UNVALIDATED"}]
+
+The PRIMARY_BET must be the agent's own selected pick among all plausible researched markets. If no market survives the betting gates, use status NO_BET and do not force a wager. In that case, give the strongest watchlist candidate as an alternative.
+
 WRITING RULES
 1. Always return a prediction when the fixture is real and some evidence exists.
-2. Clearly distinguish model prediction from validated value-bet status.
+2. Clearly distinguish model prediction from the selected betting decision.
 3. Never invent an odds price, calibration sample, lineup, injury or statistic that is absent.
 4. When evidence is sparse, explicitly say the confidence/data completeness is reduced.
 5. Do not output 'NO QUALIFIED ANALYSIS' merely because calibration or exact-market odds are missing.
-6. Use the deterministic probabilities above; do not replace them with guesses.
+6. Use deterministic probabilities above; do not replace them with guesses.
+7. Do not describe the largest Monte Carlo probability as the primary bet unless it is actually the best risk-adjusted market after considering price and evidence.
 
-Write FINAL_ANSWER with the prediction, probability, confidence/data completeness, Monte Carlo summary, available evidence, missing evidence, calibration status, and whether the selection is a validated value bet.`;
+Write FINAL_ANSWER with the primary bet block first, followed by alternatives and the full fixture analysis.`;
 
   try {
     const response = await mistralPool.call(c => c.chat.complete({
       model: 'mistral-large-latest',
       messages: [
         { role: 'system', content: prompt },
-        { role: 'user', content: `Produce the prediction for ${fixture}.` },
+        { role: 'user', content: `Select the single best plausible betting pick for ${fixture}, then write the full analysis.` },
       ] as any,
       temperature: 0.02,
-      maxTokens: 4200,
+      maxTokens: 4500,
     }));
 
     const content = response.choices?.[0]?.message?.content;
@@ -253,7 +280,7 @@ Write FINAL_ANSWER with the prediction, probability, confidence/data completenes
         recommendedOdds: selectionOdds ?? 0,
       },
       savedAt: Date.now(),
-      version: 4,
+      version: 5,
     });
 
     return {
@@ -270,7 +297,7 @@ Write FINAL_ANSWER with the prediction, probability, confidence/data completenes
       recommendedStake: scored.recommendedStake,
       recommendedOdds: selectionOdds ?? 0,
       confidence: Math.round(scored.dataCompletenessScore),
-      goalStatement: `${fixture} — ${market} — ${(trueProb * 100).toFixed(1)}% model probability`,
+      goalStatement: `${fixture} — ${market} — ${(trueProb * 100).toFixed(1)}% target probability; final decision is selected across all researched markets`,
       categoryProbabilities: scored.categoryProbabilities,
     };
   } catch (error) {
@@ -278,7 +305,7 @@ Write FINAL_ANSWER with the prediction, probability, confidence/data completenes
     emit({ type: 'error', content: `⚠️ Synthesis model failed; deterministic prediction retained: ${message}` });
 
     return {
-      finalAnswer: `Prediction for ${fixture}\n\nModel probability: ${(trueProb * 100).toFixed(1)}%\nConfidence/data completeness: ${Math.round(scored.dataCompletenessScore)}%\nCalibration: ${calibration}\nOdds: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}\nExpected value: ${(ev * 100).toFixed(2)}%\nValidated value bet: ${scored.isValueBet ? 'YES' : 'NO'}\n\n${scored.gateFailReason || 'Prediction generated from available evidence.'}`,
+      finalAnswer: `Prediction for ${fixture}\n\nModel probability: ${(trueProb * 100).toFixed(1)}%\nConfidence/data completeness: ${Math.round(scored.dataCompletenessScore)}%\nCalibration: ${calibration}\nOdds: ${selectionOdds && selectionOdds > 1 ? selectionOdds.toFixed(2) : 'UNVERIFIED'}\nExpected value: ${(ev * 100).toFixed(2)}%\nValidated value bet: ${scored.isValueBet ? 'YES' : 'NO'}\n\nPRIMARY_BET:\n{"status":"NO_BET","market":"${market}","selection":"NO_BET","probability_pct":${(trueProb * 100).toFixed(1)},"odds":${selectionOdds && selectionOdds > 1 ? selectionOdds : 'null'},"ev_pct":${(ev * 100).toFixed(2)},"confidence_pct":${Math.round(scored.dataCompletenessScore)},"reason":"Synthesis model failed; deterministic prediction retained but no independent market selection was completed.","validation":"UNVERIFIED"}\n\n${scored.gateFailReason || 'Prediction generated from available evidence.'}`,
       steps,
       success: true,
       monteCarlo: { home: mc.homeWin, draw: mc.draw, away: mc.awayWin, stdDev: mc.stdDev },
@@ -291,7 +318,7 @@ Write FINAL_ANSWER with the prediction, probability, confidence/data completenes
       recommendedStake: scored.recommendedStake,
       recommendedOdds: selectionOdds ?? 0,
       confidence: Math.round(scored.dataCompletenessScore),
-      goalStatement: `${fixture} — ${market} — ${calibration}`,
+      goalStatement: `${fixture} — ${market} — deterministic prediction retained`,
       categoryProbabilities: scored.categoryProbabilities,
       error: message,
     };
