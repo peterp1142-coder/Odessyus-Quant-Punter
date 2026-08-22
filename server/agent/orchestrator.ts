@@ -18,308 +18,97 @@ import { broadFixtureDiscovery } from './broad-fixture-sources.js';
 import { fixtureScheduler } from './fixture-task-scheduler.js';
 import { researchCacheStats } from './research-cache.js';
 
-type AgentName = 'OddsScout' | 'FormScout' | 'InjuryIntel' | 'SentimentAgent' | 'LineupScout' | 'RefereeScout' | 'TacticalScout' | 'DataQualityScout' | 'MarketMicrostructureScout' | 'ModelRiskScout' | 'PortfolioRiskScout';
-interface AgentTask { name: AgentName; focus: string; required: boolean; tier: number; }
-interface AgentPlan { agents: AgentTask[]; }
-export interface OrchestratorResult { finalAnswer: string; steps: ReActStep[]; success: boolean; error?: string; metadata: Record<string, unknown>; }
-interface DiscoveredFixture { fixture: string; kickoff?: string; status?: string; competition?: string; }
+export interface OrchestratorResult { finalAnswer:string; steps:ReActStep[]; success:boolean; error?:string; metadata:any; }
+type AgentName='OddsScout'|'FormScout'|'InjuryIntel'|'SentimentAgent'|'LineupScout'|'RefereeScout'|'TacticalScout'|'DataQualityScout'|'MarketMicrostructureScout'|'ModelRiskScout'|'PortfolioRiskScout';
+interface AgentTask{name:AgentName;focus:string;required:boolean;tier:number;}
+interface AgentPlan{reasoning:string;agents:AgentTask[];}
+interface DiscoveredFixture{fixture:string;kickoff?:string;status?:string;competition?:string;}
 
-const MARKET_TIMEZONE = process.env.MARKET_TIMEZONE || 'Africa/Lagos';
-const MAX_DISCOVERY_FIXTURES = Number(process.env.MAX_DISCOVERY_FIXTURES || 30);
-const MAX_FIXTURE_PIPELINES = Number(process.env.MAX_FIXTURE_PIPELINES || 3);
+const MARKET_TIMEZONE=process.env.MARKET_TIMEZONE||'Africa/Lagos';
+const MAX_DISCOVERY_FIXTURES=Math.max(1,Number(process.env.MAX_DISCOVERY_FIXTURES||20));
+const MAX_FIXTURE_PIPELINES=Math.max(1,Number(process.env.MAX_FIXTURE_PIPELINES||3));
 
-function marketToday(): string {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+function marketToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:MARKET_TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());}
+function fixtureMatchDate(k?:string,fallback=''){if(!k)return fallback;const d=new Date(k);if(Number.isNaN(d.getTime()))return fallback;return new Intl.DateTimeFormat('en-CA',{timeZone:MARKET_TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'}).format(d);}
+function normalizeFixtureName(v:string){return v.toLowerCase().replace(/\s+/g,' ').replace(/\s*(?:vs\.?|v\.?)\s*/g,' vs ').trim();}
+function looksLikeRealFixture(v:string){
+ const s=v.replace(/\s+/g,' ').trim();
+ if(!/^.{2,70}\s+(?:vs\.?|v\.?)\s+.{2,70}$/i.test(s))return false;
+ if(/(?:sky sports|flashscore|follow |live |schedule|fixture|fifa world cup|today's matches|matches taking place|brings you|kick-off|match time|odds by|premier league schedule|espn)/i.test(s))return false;
+ if(/\b(?:saturday|sunday|monday|tuesday|wednesday|thursday|friday),?\s+\d{1,2}\s+/i.test(s))return false;
+ return true;
 }
-function fixtureMatchDate(kickoff?: string, fallback = marketToday()): string {
-  if (!kickoff) return fallback;
-  const date = new Date(kickoff);
-  if (Number.isNaN(date.getTime())) return fallback;
-  return new Intl.DateTimeFormat('en-CA', { timeZone: MARKET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+function isCompletedStatus(status?:string){const s=String(status||'').toLowerCase();return /finished|final|ended|ft|aet|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(s);}
+function balancedJsonCandidates(raw:string){const text=raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'').trim();const out:string[]=[];for(const open of ['{','[']){let start=-1,depth=0,str=false,esc=false;for(let i=0;i<text.length;i++){const c=text[i];if(start<0){if(c===open){start=i;depth=1;}continue;}if(str){if(esc)esc=false;else if(c==='\\')esc=true;else if(c==='"')str=false;continue;}if(c==='"'){str=true;continue;}if(c===open)depth++;else if((open==='{'&&c==='}')||(open==='['&&c===']'))depth--;if(depth===0){out.push(text.slice(start,i+1));start=-1;}}}return out.sort((a,b)=>b.length-a.length);}
+function parseFixturePayload(raw:string):DiscoveredFixture[]{for(const candidate of balancedJsonCandidates(raw)){try{const v:any=JSON.parse(candidate);const list=Array.isArray(v)?v:v?.fixtures;if(!Array.isArray(list))continue;const clean=list.filter((x:any)=>x&&typeof x.fixture==='string'&&looksLikeRealFixture(x.fixture)).map((x:any)=>({fixture:x.fixture.trim(),kickoff:typeof x.kickoff==='string'?x.kickoff:undefined,status:typeof x.status==='string'?x.status:'scheduled',competition:typeof x.competition==='string'?x.competition:undefined}));if(clean.length)return clean;}catch{}}return[];}
+function extractStructuredFallback(raw:string):DiscoveredFixture[]{const out:DiscoveredFixture[]=[];for(const c of balancedJsonCandidates(raw)){try{const root:any=JSON.parse(c);const walk=(n:any)=>{if(!n||typeof n!=='object')return;if(Array.isArray(n)){for(const x of n)walk(x);return;}const home=n.homeTeam?.name||n.home_team?.name||n.home?.name||n.homeTeam||n.home_team||n.home;const away=n.awayTeam?.name||n.away_team?.name||n.away?.name||n.awayTeam||n.away_team||n.away;const kickoff=n.kickoff||n.startTime||n.start_time||n.date||n.utcDate||n.utc_date;const status=n.status?.type?.short||n.status?.short||n.status||n.fixture?.status?.short;const fixture=typeof home==='string'&&typeof away==='string'?`${home} vs ${away}`:'';if(fixture&&looksLikeRealFixture(fixture)&&typeof kickoff==='string')out.push({fixture,kickoff,status:typeof status==='string'?status:'scheduled',competition:n.competition?.name||n.league?.name});for(const child of Object.values(n))walk(child);};walk(root);}catch{}}return out;}
+function dedupeFixtures(values:DiscoveredFixture[],requestedDate:string){const seen=new Set<string>(),out:DiscoveredFixture[]=[];for(const v of values){if(!v.fixture||!looksLikeRealFixture(v.fixture)||isCompletedStatus(v.status))continue;if(v.kickoff){const d=new Date(v.kickoff);if(Number.isNaN(d.getTime()))continue;if(d.getTime()<Date.now()-120000)continue;if(fixtureMatchDate(v.kickoff,requestedDate)!==requestedDate)continue;}const key=normalizeFixtureName(v.fixture);if(seen.has(key))continue;seen.add(key);out.push(v);if(out.length>=MAX_DISCOVERY_FIXTURES)break;}return out;}
+
+async function discoverFixtures(userQuery:string,sport:string,date:string,onStep:(s:ReActStep)=>void){
+ onStep({type:'status',content:`🔍 Discovering real ${sport} fixtures for ${date} in ${MARKET_TIMEZONE}…`});
+ const {fetchMatchesToday,allSportsFixtures}=await import('./tools.js');
+ const [broad,web,api]=await Promise.allSettled([
+   broadFixtureDiscovery(date,sport),
+   fetchMatchesToday(sport,date),
+   sport.toLowerCase()==='football'?allSportsFixtures(date,date):Promise.resolve({success:false,data:'',error:'unsupported sport'})
+ ]);
+ const chunks:string[]=[];
+ for(const r of [broad,web,api])if(r.status==='fulfilled'&&r.value?.success&&r.value?.data)chunks.push(String(r.value.data));
+ const combined=chunks.join('\n\n');
+ if(!combined){onStep({type:'error',content:`No fixture source returned data for ${date}.`});return{fixtures:[],rawSchedule:''};}
+ let modelFixtures:DiscoveredFixture[]=[];
+ try{
+   const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-small-latest',messages:[
+     {role:'system',content:'Extract ONLY explicit real sporting fixtures from the supplied schedule text. Return JSON only: {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Never return article titles, source descriptions, league names, headings, or sentences containing a fixture as part of a headline. The fixture field must contain ONLY two team names joined by vs. Kickoff must come from the supplied text; never invent dates or times.'},
+     {role:'user',content:`Requested market date: ${date}\nTimezone: ${MARKET_TIMEZONE}\nUser request: ${userQuery}\nSUPPLIED SCHEDULE DATA:\n${combined.slice(0,30000)}`}
+   ] as any,temperature:0,maxTokens:Math.min(5000,200+MAX_DISCOVERY_FIXTURES*140)}));
+   modelFixtures=parseFixturePayload(String(r.choices?.[0]?.message?.content||''));
+ }catch(e){onStep({type:'error',content:`Structured fixture extraction failed: ${e instanceof Error?e.message:String(e)}`});}
+ const structured=extractStructuredFallback(combined);
+ const fixtures=dedupeFixtures([...modelFixtures,...structured],date);
+ if(fixtures.length)onStep({type:'thought',content:`📋 ${fixtures.length} real fixtures admitted: ${fixtures.map(f=>`${f.fixture} [${fixtureMatchDate(f.kickoff,date)}]`).join(' | ')}`});
+ else onStep({type:'error',content:`No clean fixtures passed the identity/date gate for ${date}.`});
+ return{fixtures,rawSchedule:combined};
 }
-function isCompletedStatus(status?: string): boolean {
-  const value = String(status || '').toLowerCase().trim();
-  return !!value && /finished|final|ended|ft|aet|after penalties|cancelled|canceled|postponed|abandoned|walkover|live|in.?play|half.?time/.test(value);
+
+async function parseQuery(userQuery:string){
+ try{const r=await mistralPool.call(c=>c.chat.complete({model:'mistral-small-latest',messages:[{role:'system',content:'Return JSON only.'},{role:'user',content:`Extract sport, requested market and whether the user named one fixture or wants multiple/open fixtures from: ${userQuery}. Return {"fixture":"Team A vs Team B or multiple/open","sport":"football","market":"Match Result","matchDate":"today or YYYY-MM-DD"}.`} ] as any,temperature:0,maxTokens:200}));for(const c of balancedJsonCandidates(String(r.choices?.[0]?.message?.content||''))){try{const p:any=JSON.parse(c);return{fixture:p.fixture||'multiple/open',sport:p.sport||'football',market:p.market||'Match Result',matchDate:p.matchDate==='today'||!p.matchDate?marketToday():String(p.matchDate)};}catch{}}}catch{}return{fixture:'multiple/open',sport:'football',market:'Match Result',matchDate:marketToday()};
 }
-function normalizeFixtureName(value: string): string {
-  return value.toLowerCase().replace(/\s+/g, ' ').replace(/\s*(?:vs\.?|v\.?|[-–—])\s*/g, ' vs ').trim();
-}
-function looksLikeMatch(value: string): boolean {
-  const match = value.trim().match(/^(.{2,100}?)\s+(?:vs\.?|v\.?)\s+(.{2,100}?)$/i);
-  if (!match) return false;
-  const home = match[1].trim();
-  const away = match[2].trim();
-  if (!home || !away) return false;
-  if (/^(fixtures?|schedule|league|today|tomorrow)$/i.test(home)) return false;
-  if (/^(fixtures?|schedule|league|today|tomorrow)$/i.test(away)) return false;
-  return true;
-}
-function parseJsonCandidates(raw: string): unknown[] {
-  const text = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  const candidates: string[] = [];
-  for (const opening of ['{', '['] as const) {
-    let start = -1;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = 0; i < text.length; i += 1) {
-      const ch = text[i];
-      if (start < 0) { if (ch === opening) { start = i; depth = 1; } continue; }
-      if (inString) { if (escaped) escaped = false; else if (ch === '\\') escaped = true; else if (ch === '"') inString = false; continue; }
-      if (ch === '"') inString = true;
-      else if (ch === opening) depth += 1;
-      else if ((opening === '{' && ch === '}') || (opening === '[' && ch === ']')) depth -= 1;
-      if (depth === 0) { candidates.push(text.slice(start, i + 1)); start = -1; }
-    }
-  }
-  return candidates.sort((a, b) => b.length - a.length).map((value) => { try { return JSON.parse(value); } catch { return null; } }).filter(Boolean);
-}
-function extractFixturesFromModel(raw: string): DiscoveredFixture[] {
-  for (const candidate of parseJsonCandidates(raw)) {
-    const value = candidate as any;
-    const list = Array.isArray(value) ? value : Array.isArray(value?.fixtures) ? value.fixtures : [];
-    const fixtures = list.filter((item: any) => item && typeof item.fixture === 'string' && looksLikeMatch(item.fixture));
-    if (fixtures.length) return fixtures;
-  }
-  return [];
-}
-function extractFixturesFromLines(raw: string, requestedDate: string): DiscoveredFixture[] {
-  const result: DiscoveredFixture[] = [];
-  const seen = new Set<string>();
-  for (const line of raw.split(/\r?\n/)) {
-    const cleaned = line.replace(/^[-*•\d.)]+\s*/, '').replace(/\*+/g, '').trim();
-    const match = cleaned.match(/(.{2,100}?\s+(?:vs\.?|v\.?)\s+.{2,100}?)(?:\s*[-–—|,]\s*|\s+)(\d{1,2}:\d{2})/i);
-    const fixture = (match?.[1] || cleaned).trim();
-    if (!looksLikeMatch(fixture)) continue;
-    const key = normalizeFixtureName(fixture);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({ fixture, kickoff: match ? `${requestedDate}T${match[2]}:00` : undefined, status: 'scheduled' });
-    if (result.length >= MAX_DISCOVERY_FIXTURES) break;
-  }
-  return result;
-}
-function validateFixtures(values: DiscoveredFixture[], requestedDate: string): DiscoveredFixture[] {
-  const seen = new Set<string>();
-  const result: DiscoveredFixture[] = [];
-  for (const value of values) {
-    if (!value?.fixture || !looksLikeMatch(value.fixture) || isCompletedStatus(value.status)) continue;
-    if (value.kickoff && fixtureMatchDate(value.kickoff, requestedDate) !== requestedDate) continue;
-    const key = normalizeFixtureName(value.fixture);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({ ...value, fixture: value.fixture.trim(), status: value.status || 'scheduled' });
-    if (result.length >= MAX_DISCOVERY_FIXTURES) break;
-  }
-  return result;
-}
-async function discoverFixtures(userQuery: string, sport: string, requestedDate: string, onStep: (step: ReActStep) => void): Promise<{ fixtures: DiscoveredFixture[]; rawSchedule: string }> {
-  onStep({ type: 'status', content: `🔍 Discovering the full ${sport} slate for ${requestedDate} in ${MARKET_TIMEZONE}…` });
-  const { fetchMatchesToday, allSportsFixtures } = await import('./tools.js');
-  const [broad, web, structured] = await Promise.allSettled([
-    broadFixtureDiscovery(requestedDate, sport),
-    fetchMatchesToday(sport, requestedDate),
-    sport.toLowerCase() === 'football' ? allSportsFixtures(requestedDate, requestedDate) : Promise.resolve({ success: false, data: '', error: 'structured football source only' }),
-  ]);
-  const sources: string[] = [];
-  if (broad.status === 'fulfilled' && broad.value.success && broad.value.data) sources.push(`=== BROAD ===\n${broad.value.data}`);
-  if (web.status === 'fulfilled' && web.value.success && web.value.data) sources.push(`=== WEB ===\n${web.value.data}`);
-  if (structured.status === 'fulfilled' && structured.value.success && structured.value.data) sources.push(`=== STRUCTURED ===\n${structured.value.data}`);
-  const combined = sources.join('\n\n');
-  if (!combined) return { fixtures: [], rawSchedule: '' };
-  let modelFixtures: DiscoveredFixture[] = [];
-  try {
-    const response = await mistralPool.call((client) => client.chat.complete({
-      model: 'mistral-small-latest',
-      messages: [
-        { role: 'system', content: 'Extract ALL real future matches from supplied schedules. Return JSON only as {"fixtures":[{"fixture":"Home vs Away","kickoff":"ISO-8601","status":"scheduled","competition":"..."}]}. Never return league names or headings. Do not limit to famous clubs.' },
-        { role: 'user', content: `User query: ${userQuery}\nRequested date: ${requestedDate}\nTimezone: ${MARKET_TIMEZONE}\nNow: ${new Date().toISOString()}\nReturn up to ${MAX_DISCOVERY_FIXTURES} distinct future fixtures from the supplied slate. Exclude started, live, finished, postponed and cancelled matches.` },
-      ] as any,
-      temperature: 0,
-      maxTokens: Math.min(5000, 200 + MAX_DISCOVERY_FIXTURES * 150),
-    }));
-    modelFixtures = extractFixturesFromModel(String(response.choices?.[0]?.message?.content || ''));
-  } catch (error) {
-    onStep({ type: 'error', content: `Discovery model failed; deterministic fallback active: ${error instanceof Error ? error.message : String(error)}` });
-  }
-  const valid = validateFixtures([...modelFixtures, ...extractFixturesFromLines(combined, requestedDate)], requestedDate);
-  onStep({ type: valid.length ? 'thought' : 'error', content: valid.length ? `📊 ${valid.length} canonical fixtures admitted: ${valid.map((fx) => `${fx.fixture} [${fixtureMatchDate(fx.kickoff, requestedDate)}]`).join(' | ')}` : `⚠️ No verified future fixtures passed the registry gate for ${requestedDate}.` });
-  return { fixtures: valid, rawSchedule: combined };
-}
-async function parseQuery(userQuery: string) {
-  try {
-    const response = await mistralPool.call((client) => client.chat.complete({ model: 'mistral-small-latest', messages: [{ role: 'system', content: 'Extract match info. Return JSON only.' }, { role: 'user', content: `Extract from "${userQuery}". Return {"fixture":"Team A vs Team B or multiple/open","sport":"football","market":"Match Result","matchDate":"today or YYYY-MM-DD"}.` }] as any, temperature: 0, maxTokens: 200 }));
-    for (const candidate of parseJsonCandidates(String(response.choices?.[0]?.message?.content || ''))) {
-      const parsed = candidate as any;
-      if (!parsed || typeof parsed !== 'object') continue;
-      return { fixture: parsed.fixture || userQuery, sport: parsed.sport || 'football', market: parsed.market || 'Match Result', matchDate: parsed.matchDate === 'today' ? marketToday() : parsed.matchDate || marketToday() };
-    }
-  } catch {}
-  return { fixture: userQuery, sport: 'football', market: 'Match Result', matchDate: marketToday() };
-}
-async function buildPlan(): Promise<AgentPlan> {
-  return { agents: [
-    { name: 'OddsScout', focus: 'Verify exact-market odds for this fixture.', required: true, tier: 1 },
-    { name: 'FormScout', focus: 'Verify current-season form, xG and H2H for this fixture.', required: true, tier: 1 },
-    { name: 'InjuryIntel', focus: 'Verify injuries, suspensions and player availability for this fixture.', required: true, tier: 2 },
-    { name: 'SentimentAgent', focus: 'Verify current team news, weather and match context for this fixture.', required: false, tier: 2 },
-    { name: 'RefereeScout', focus: 'Verify referee assignment and relevant referee evidence for this fixture.', required: false, tier: 2 },
-    { name: 'MarketMicrostructureScout', focus: 'Verify bookmaker dispersion, overround and price integrity for this fixture.', required: true, tier: 2 },
-    { name: 'LineupScout', focus: 'Verify confirmed or predicted lineups and late team news for this fixture.', required: true, tier: 3 },
-    { name: 'TacticalScout', focus: 'Assess the exact tactical matchup for this fixture.', required: false, tier: 3 },
-    { name: 'ModelRiskScout', focus: 'Adversarially stress-test the developing prediction for this fixture.', required: true, tier: 4 },
-    { name: 'DataQualityScout', focus: 'Audit freshness, provenance and contradictions for this fixture.', required: true, tier: 4 },
-  ] };
-}
-function canonicalFixtureContext(fixture: DiscoveredFixture, sport: string, requestedDate: string): string {
-  const matchDate = fixtureMatchDate(fixture.kickoff, requestedDate);
-  return ['=== CANONICAL FIXTURE REGISTRY ENTRY ===', `Fixture: ${fixture.fixture}`, `Sport: ${sport}`, `Match date: ${matchDate}`, `Kickoff: ${fixture.kickoff || 'unverified'}`, `Competition: ${fixture.competition || 'verified by registry'}`, 'RULE: This is the ONLY fixture this specialist may research.', `ALL DATE-SPECIFIC SEARCHES MUST USE ${matchDate}.`, 'Do not substitute, merge, or transfer evidence from another fixture.', '=== END CANONICAL FIXTURE REGISTRY ENTRY ==='].join('\n');
-}
-async function dispatchOne(task: AgentTask, fixture: DiscoveredFixture, sport: string, requestedDate: string, sessionId: string, prior: string, onStep: (step: ReActStep) => void): Promise<SubAgentResult> {
-  const matchDate = fixtureMatchDate(fixture.kickoff, requestedDate);
-  const taskText = `${canonicalFixtureContext(fixture, sport, requestedDate)}\n\n${task.focus}\n\n${prior}`;
-  switch (task.name) {
-    case 'OddsScout': return runOddsScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'FormScout': return runFormScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'InjuryIntel': return runInjuryIntel(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'SentimentAgent': return runSentimentAgent(fixture.fixture, sport, matchDate, sessionId, onStep, taskText);
-    case 'LineupScout': return runLineupScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'RefereeScout': return runRefereeScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'TacticalScout': return runTacticalScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'DataQualityScout': return runDataQualityScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'MarketMicrostructureScout': return runMarketMicrostructureScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'ModelRiskScout': return runModelRiskScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    case 'PortfolioRiskScout': return runPortfolioRiskScout(fixture.fixture, sport, sessionId, onStep, taskText);
-    default: throw new Error(`Unsupported agent: ${task.name}`);
-  }
-}
-async function dispatchAgent(task: AgentTask, fixture: DiscoveredFixture, sport: string, requestedDate: string, sessionId: string, prior: string, onStep: (step: ReActStep) => void): Promise<SubAgentResult> {
-  return fixtureScheduler.enqueue({
-    agentName: task.name,
-    fixture: fixture.fixture,
-    tier: task.tier,
-    run: () => dispatchOne(task, fixture, sport, requestedDate, sessionId, prior, (step) => onStep({ ...step, content: `[${fixture.fixture}] ${step.content}` })),
-  }, (position: number) => onStep({ type: 'status', content: `⏳ ${task.name}: ${fixture.fixture} queued behind ${position} job(s).` }));
-}
-function priorContext(results: Record<string, SubAgentResult>): string {
-  const entries = Object.entries(results);
-  if (!entries.length) return '';
-  return ['=== PRIOR EVIDENCE ===', ...entries.map(([name, result]) => `[${name}]\n${(result.rawOutput || JSON.stringify(result.data)).slice(0, 1800)}`), '=== END PRIOR EVIDENCE ==='].join('\n\n');
-}
-function aggregateSingle(name: AgentName, fixture: DiscoveredFixture, results: Record<string, SubAgentResult>): SubAgentResult {
-  return results[name] || { agentName: name, success: false, data: {}, steps: [], rawOutput: '', error: `No result for ${fixture.fixture}` };
-}
-function advancedEvidence(results: Record<string, SubAgentResult>, portfolio: SubAgentResult): string {
-  const names: AgentName[] = ['RefereeScout', 'TacticalScout', 'MarketMicrostructureScout', 'ModelRiskScout', 'DataQualityScout'];
-  return [...names.map((name) => results[name]?.rawOutput || ''), portfolio.rawOutput || ''].filter(Boolean).join('\n\n');
-}
-async function runFixturePipeline(fixture: DiscoveredFixture, index: number, plan: AgentPlan, scheduleContext: string, sessionId: string, sport: string, requestedDate: string, onStep: (step: ReActStep) => void): Promise<Record<string, SubAgentResult>> {
-  const results: Record<string, SubAgentResult> = {};
-  const matchDate = fixtureMatchDate(fixture.kickoff, requestedDate);
-  onStep({ type: 'status', content: `📅 ${fixture.fixture} · canonical match date ${matchDate}` });
-  for (const tier of [1, 2, 3, 4]) {
-    const tasks = plan.agents.filter((agent) => agent.tier === tier);
-    if (!tasks.length) continue;
-    const prior = [canonicalFixtureContext(fixture, sport, requestedDate), scheduleContext, priorContext(results)].filter(Boolean).join('\n\n');
-    onStep({ type: 'status', content: `🚦 ${fixture.fixture} · Tier ${tier}: ${tasks.map((task) => task.name).join(' + ')}` });
-    const settled = await Promise.allSettled(tasks.map((task) => dispatchAgent(task, fixture, sport, requestedDate, `${sessionId}-${index}-${task.name}`, prior, onStep)));
-    tasks.forEach((task, taskIndex) => {
-      const result = settled[taskIndex];
-      if (result.status === 'fulfilled') {
-        results[task.name] = result.value;
-        onStep({ type: result.value.success ? 'thought' : 'error', content: `${result.value.success ? '✅' : '⚠️'} ${fixture.fixture} · ${task.name} ${result.value.success ? 'complete' : 'failed'}.` });
-      } else {
-        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
-        results[task.name] = { agentName: task.name, success: false, data: {}, steps: [], rawOutput: '', error };
-        onStep({ type: 'error', content: `💥 ${fixture.fixture} · ${task.name}: ${error}` });
-      }
-    });
-  }
-  return results;
-}
-export async function runOrchestrator(userQuery: string, sessionId: string, onStep: (step: ReActStep) => void): Promise<OrchestratorResult> {
-  const steps: ReActStep[] = [];
-  const emit = (step: ReActStep) => { const enriched = { ...step, timestamp: new Date().toISOString() }; steps.push(enriched); onStep(enriched); };
-  const parsed = await parseQuery(userQuery);
-  const sport = parsed.sport;
-  const market = parsed.market;
-  const requestedDate = parsed.matchDate;
-  let fixtures: DiscoveredFixture[] = [];
-  let schedule = '';
-  if (!parsed.fixture || parsed.fixture === 'multiple/open' || parsed.fixture === userQuery) {
-    const discovered = await discoverFixtures(userQuery, sport, requestedDate, emit);
-    fixtures = discovered.fixtures;
-    schedule = discovered.rawSchedule;
-  }
-  if (!fixtures.length && parsed.fixture && parsed.fixture !== 'multiple/open') fixtures = [{ fixture: parsed.fixture, status: 'scheduled' }];
-  if (!fixtures.length) return { finalAnswer: `NO QUALIFIED FIXTURES: I could not verify future fixtures for ${requestedDate}.`, steps, success: true, metadata: { requestedDate, agentsRun: [] } };
-  const plan = await buildPlan();
-  const registry: Record<string, Record<string, SubAgentResult>> = {};
-  const scheduleContext = schedule ? `=== VERIFIED DISCOVERY SCHEDULE ===\n${schedule.slice(0, 6000)}` : '';
-  let nextIndex = 0;
-  const workerCount = Math.min(MAX_FIXTURE_PIPELINES, fixtures.length);
-  const workers = Array.from({ length: workerCount }, async () => {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= fixtures.length) return;
-      const fixture = fixtures[index];
-      registry[fixture.fixture] = await runFixturePipeline(fixture, index, plan, scheduleContext, sessionId, sport, requestedDate, emit);
-    }
-  });
-  await Promise.all(workers);
-  let portfolio: SubAgentResult = { agentName: 'PortfolioRiskScout', success: false, data: {}, steps: [], rawOutput: '', error: 'not run' };
-  if (fixtures.length > 1) {
-    const allEvidence = Object.entries(registry).map(([fixture, results]) => `=== ${fixture} ===\n${priorContext(results)}`).join('\n\n');
-    const portfolioFixture = { fixture: fixtures.map((item) => item.fixture).join(' | '), status: 'scheduled' };
-    portfolio = await dispatchAgent({ name: 'PortfolioRiskScout', focus: 'Review the complete candidate slate for correlation, common factors and concentration. Do not replace fixture-specific conclusions.', required: true, tier: 5 }, portfolioFixture, sport, requestedDate, `${sessionId}-portfolio`, allEvidence, emit);
-  }
-  const fixtureAnswers: string[] = [];
-  const predictions: Array<Record<string, unknown>> = [];
-  for (let index = 0; index < fixtures.length; index += 1) {
-    const fixture = fixtures[index];
-    const results = registry[fixture.fixture] || {};
-    const matchDate = fixtureMatchDate(fixture.kickoff, requestedDate);
-    emit({ type: 'status', content: `🧮 Synthesizing ${fixture.fixture} independently for ${matchDate}…` });
-    const q = await runQuantSynthesis({
-      userQuery,
-      fixture: fixture.fixture,
-      sport,
-      market,
-      sessionId: `${sessionId}-synthesis-${index}`,
-      oddsResult: aggregateSingle('OddsScout', fixture, results),
-      formResult: aggregateSingle('FormScout', fixture, results),
-      injuryResult: aggregateSingle('InjuryIntel', fixture, results),
-      sentimentResult: aggregateSingle('SentimentAgent', fixture, results),
-      lineupResult: aggregateSingle('LineupScout', fixture, results),
-      advancedText: advancedEvidence(results, portfolio),
-      onStep: emit,
-      isMultiFixture: false,
-      discoveredFixtures: [fixture.fixture],
-    });
-    if (q.success) {
-      fixtureAnswers.push(`## ${fixture.fixture}\n### Match date: ${matchDate}\n\n${q.finalAnswer || 'NO QUALIFIED ANALYSIS'}`);
-      predictions.push({ fixture: fixture.fixture, date: matchDate, success: true, probability: q.trueProb * 100, confidence: q.confidence, starRating: q.starRating, expectedValue: q.expectedValue, isValueBet: q.isValueBet, recommendedOdds: q.recommendedOdds });
-      logPrediction({ predictionId: `${sessionId}-${index}-${Date.now()}`, fixture: fixture.fixture, sport, market, predictedProb: q.trueProb, impliedProb: q.impliedProb, expectedValue: q.expectedValue, isValueBet: q.isValueBet, starRating: q.starRating });
-    } else {
-      fixtureAnswers.push(`## ${fixture.fixture}\n### Match date: ${matchDate}\n\nNO QUALIFIED ANALYSIS\n\n${q.error || 'Synthesis failed for this fixture.'}`);
-      predictions.push({ fixture: fixture.fixture, date: matchDate, success: false, error: q.error || 'synthesis failed' });
-    }
-  }
-  emit({ type: 'synthesis', content: `🏆 Independent synthesis complete for ${fixtures.length} fixture(s) — every fixture received its own date-scoped evidence and result.` });
-  return {
-    finalAnswer: fixtureAnswers.join('\n\n'),
-    steps,
-    success: true,
-    metadata: {
-      requestedDate,
-      fixtures: fixtures.map((fixture) => ({ fixture: fixture.fixture, kickoff: fixture.kickoff, date: fixtureMatchDate(fixture.kickoff, requestedDate) })),
-      predictions,
-      agentsRun: [...plan.agents.map((agent) => agent.name), ...(portfolio.success ? ['PortfolioRiskScout'] : [])],
-      queueSnapshot: fixtureScheduler.snapshot(),
-      researchCache: researchCacheStats(),
-      fixtureRegistry: Object.fromEntries(Object.entries(registry).map(([fixture, results]) => [fixture, Object.fromEntries(Object.entries(results).map(([name, result]) => [name, result.success]))])),
-      portfolioRisk: portfolio.data,
-      poolStatus: mistralPool.status(),
-    },
-  };
+
+async function buildPlan(fixture:string):Promise<AgentPlan>{return{reasoning:'Fixture-scoped dependency DAG with independent evidence and portfolio review.',agents:[
+ {name:'OddsScout',focus:`Verify exact-market odds for ${fixture}.`,required:false,tier:1},
+ {name:'FormScout',focus:`Verify current-season form, xG, venue splits and H2H for ${fixture}.`,required:true,tier:1},
+ {name:'InjuryIntel',focus:`Verify injuries, suspensions and availability for ${fixture}.`,required:false,tier:2},
+ {name:'SentimentAgent',focus:`Verify team news, motivation and external context for ${fixture}.`,required:false,tier:2},
+ {name:'RefereeScout',focus:`Verify referee evidence for ${fixture}.`,required:false,tier:2},
+ {name:'MarketMicrostructureScout',focus:`Verify market dispersion and liquidity for ${fixture}.`,required:false,tier:2},
+ {name:'LineupScout',focus:`Verify confirmed/predicted lineups for ${fixture}.`,required:false,tier:3},
+ {name:'TacticalScout',focus:`Assess tactical matchup for ${fixture}.`,required:false,tier:3},
+ {name:'ModelRiskScout',focus:`Stress-test the developing prediction for ${fixture}.`,required:false,tier:4},
+ {name:'DataQualityScout',focus:`Audit evidence freshness and contradictions for ${fixture}.`,required:false,tier:4}
+]};}
+function canonicalFixtureContext(fixture:string,sport:string,matchDate:string,competition?:string){return`=== CANONICAL FIXTURE REGISTRY ENTRY ===\nFixture: ${fixture}\nSport: ${sport}\nMatch date: ${matchDate}\nCompetition: ${competition||'verified registry'}\nRULE: Analyze ONLY this fixture/date. Never substitute another match.\n=== END CANONICAL FIXTURE REGISTRY ENTRY ===`;}
+async function dispatchOne(task:AgentTask,fixture:string,sport:string,matchDate:string,sessionId:string,prior:string,onStep:(s:ReActStep)=>void):Promise<SubAgentResult>{const taskText=`${canonicalFixtureContext(fixture,sport,matchDate)}\n\n${task.focus}\n\n${prior}`;switch(task.name){case'OddsScout':return runOddsScout(fixture,sport,sessionId,onStep,taskText);case'FormScout':return runFormScout(fixture,sport,sessionId,onStep,taskText);case'InjuryIntel':return runInjuryIntel(fixture,sport,sessionId,onStep,taskText);case'SentimentAgent':return runSentimentAgent(fixture,sport,matchDate,sessionId,onStep,taskText);case'LineupScout':return runLineupScout(fixture,sport,sessionId,onStep,taskText);case'RefereeScout':return runRefereeScout(fixture,sport,sessionId,onStep,taskText);case'TacticalScout':return runTacticalScout(fixture,sport,sessionId,onStep,taskText);case'DataQualityScout':return runDataQualityScout(fixture,sport,sessionId,onStep,taskText);case'MarketMicrostructureScout':return runMarketMicrostructureScout(fixture,sport,sessionId,onStep,taskText);case'ModelRiskScout':return runModelRiskScout(fixture,sport,sessionId,onStep,taskText);default:throw new Error(`Unsupported agent ${task.name}`);}}
+async function dispatchAgent(task:AgentTask,fixture:string,sport:string,matchDate:string,sessionId:string,prior:string,onStep:(s:ReActStep)=>void){return fixtureScheduler.enqueue({agentName:task.name,fixture,tier:task.tier,run:()=>dispatchOne(task,fixture,sport,matchDate,sessionId,prior,s=>onStep({...s,content:`[${fixture}] ${s.content}`}))},position=>onStep({type:'status',content:`⏳ ${task.name}: ${fixture} queued behind ${position} job(s).`}));}
+function priorContext(results:Record<string,SubAgentResult>){return Object.entries(results).map(([name,r])=>`[${name}] ${(r.rawOutput||JSON.stringify(r.data)).slice(0,2200)}`).join('\n\n');}
+async function runFixturePipeline(fx:DiscoveredFixture,index:number,plan:AgentPlan,schedule:string,sessionId:string,sport:string,requestedDate:string,onStep:(s:ReActStep)=>void){const matchDate=fixtureMatchDate(fx.kickoff,requestedDate),results:Record<string,SubAgentResult>={};const canonical=canonicalFixtureContext(fx.fixture,sport,matchDate,fx.competition);for(const tier of [1,2,3,4]){const tasks=plan.agents.filter(a=>a.tier===tier);const settled=await Promise.allSettled(tasks.map(t=>dispatchAgent(t,fx.fixture,sport,matchDate,`${sessionId}-${index}-${t.name}`,`${canonical}\n=== DISCOVERY ===\n${schedule.slice(0,5000)}\n${priorContext(results)}`,onStep)));settled.forEach((r,i)=>{if(r.status==='fulfilled')results[tasks[i].name]=r.value;else results[tasks[i].name]={agentName:tasks[i].name,success:false,data:{},steps:[],rawOutput:'',error:String(r.reason)};});}return results;}
+function aggregateOne(name:AgentName,fixture:string,results:Record<string,SubAgentResult>):SubAgentResult{const r=results[name];return r||{agentName:name,success:false,data:{},steps:[],rawOutput:'',error:`No ${name} result for ${fixture}`};}
+function advancedText(results:Record<string,SubAgentResult>){return ['RefereeScout','TacticalScout','MarketMicrostructureScout','ModelRiskScout','DataQualityScout'].map(n=>results[n]?.rawOutput||'').filter(Boolean).join('\n\n');}
+
+export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(step:ReActStep)=>void):Promise<OrchestratorResult>{
+ const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};
+ const parsed=await parseQuery(userQuery);let fixtures:DiscoveredFixture[]=[];let schedule='';
+ if(parsed.fixture==='multiple/open'||parsed.fixture===userQuery){const d=await discoverFixtures(userQuery,parsed.sport,parsed.matchDate,emit);fixtures=d.fixtures;schedule=d.rawSchedule;}
+ else fixtures=[{fixture:parsed.fixture,status:'scheduled'}];
+ if(!fixtures.length)return{finalAnswer:`NO QUALIFIED FIXTURES: No clean future fixtures were verified for ${parsed.matchDate}.`,steps,success:true,metadata:{fixture:'',sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:[]}};
+ const plan=await buildPlan(fixtures.map(f=>f.fixture).join(' | '));const registry:Record<string,Record<string,SubAgentResult>>={};let next=0;const workers=Array.from({length:Math.min(MAX_FIXTURE_PIPELINES,fixtures.length)},async()=>{while(true){const i=next++;if(i>=fixtures.length)return;registry[fixtures[i].fixture]=await runFixturePipeline(fixtures[i],i,plan,schedule,sessionId,parsed.sport,parsed.matchDate,emit);}});await Promise.all(workers);
+ const outputs:string[]=[];const predictions:any[]=[];
+ for(let i=0;i<fixtures.length;i++){
+  const fx=fixtures[i],results=registry[fx.fixture]||{},date=fixtureMatchDate(fx.kickoff,parsed.matchDate);emit({type:'status',content:`🧮 Synthesizing ${fx.fixture} independently for ${date}…`});
+  const q=await runQuantSynthesis({userQuery,fixture:fx.fixture,sport:parsed.sport,market:parsed.market,sessionId:`${sessionId}-synthesis-${i}`,oddsResult:aggregateOne('OddsScout',fx.fixture,results),formResult:aggregateOne('FormScout',fx.fixture,results),injuryResult:aggregateOne('InjuryIntel',fx.fixture,results),sentimentResult:aggregateOne('SentimentAgent',fx.fixture,results),lineupResult:aggregateOne('LineupScout',fx.fixture,results),advancedText:advancedText(results),onStep:emit,isMultiFixture:false,discoveredFixtures:[fx.fixture]});
+  outputs.push(`## ${fx.fixture}\n**Match date:** ${date}\n\n${q.finalAnswer||'NO QUALIFIED ANALYSIS'}`);predictions.push({fixture:fx.fixture,date,success:q.success,probability:q.trueProb*100,confidence:q.confidence,starRating:q.starRating,expectedValue:q.expectedValue,isValueBet:q.isValueBet});
+  if(q.success)logPrediction({predictionId:`${sessionId}-${i}-${Date.now()}`,fixture:fx.fixture,sport:parsed.sport,market:parsed.market,predictedProb:q.trueProb,impliedProb:q.impliedProb,expectedValue:q.expectedValue,isValueBet:q.isValueBet,starRating:q.starRating});
+ }
+ const finalAnswer=outputs.join('\n\n');emit({type:'synthesis',content:`🏆 Independent synthesis complete for ${outputs.length}/${fixtures.length} verified fixtures.`});
+ return{finalAnswer,steps,success:true,metadata:{fixture:fixtures.map(f=>f.fixture).join(' | '),sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:fixtures.map(f=>({fixture:f.fixture,kickoff:f.kickoff,date:fixtureMatchDate(f.kickoff,parsed.matchDate)})),predictions,agentsRun:plan.agents.map(a=>a.name),queueSnapshot:fixtureScheduler.snapshot(),researchCache:researchCacheStats(),fixtureRegistry:Object.fromEntries(Object.entries(registry).map(([fx,r])=>[fx,Object.fromEntries(Object.entries(r).map(([n,v])=>[n,v.success]))])),poolStatus:mistralPool.status()}};
 }
