@@ -16,6 +16,35 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function parseDateToken(value: string, matchDate: string): string | null {
+  const raw = value.trim().replace(/\s+/g, ' ');
+  const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (iso) return iso[1] === matchDate ? iso[1] : null;
+
+  const slash = raw.match(/\b(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})\b/);
+  if (slash) {
+    const candidate = `${slash[3]}-${String(slash[2]).padStart(2, '0')}-${String(slash[1]).padStart(2, '0')}`;
+    return candidate === matchDate ? candidate : null;
+  }
+
+  const monthNames = '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+  const dmy = raw.match(new RegExp(`\\b(\\d{1,2})\\s+(${monthNames})\\s+(\\d{4})\\b`, 'i'));
+  if (dmy) {
+    const month = new Date(`${dmy[2]} 1, ${dmy[3]}`).getMonth() + 1;
+    const candidate = `${dmy[3]}-${String(month).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+    return candidate === matchDate ? candidate : null;
+  }
+
+  const mdy = raw.match(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:st|nd|rd|th)?[,]?\\s+(\\d{4})\\b`, 'i'));
+  if (mdy) {
+    const month = new Date(`${mdy[1]} 1, ${mdy[3]}`).getMonth() + 1;
+    const candidate = `${mdy[3]}-${String(month).padStart(2, '0')}-${String(mdy[2]).padStart(2, '0')}`;
+    return candidate === matchDate ? candidate : null;
+  }
+
+  return null;
+}
+
 function isoForMarketDate(date: string, time: string, timeZone: string): string | null {
   const m = time.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
   if (!m) return null;
@@ -24,8 +53,6 @@ function isoForMarketDate(date: string, time: string, timeZone: string): string 
   const second = Number(m[3] || 0);
   if (hour > 23 || minute > 59 || second > 59) return null;
 
-  // Interpret a bare kickoff time as being in the requested market timezone.
-  // This is important for schedule pages/APIs that return `18:00` without a TZ.
   const probe = new Date(`${date}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}Z`);
   if (Number.isNaN(probe.getTime())) return null;
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -42,11 +69,9 @@ function isoForMarketDate(date: string, time: string, timeZone: string): string 
 
 function isoFromExplicitDateTime(value: string, matchDate: string, timeZone: string): string | null {
   const raw = value.trim().replace(/\s+/g, ' ');
-  const dateMatch = raw.match(/(\d{4}-\d{2}-\d{2})/);
+  const date = parseDateToken(raw, matchDate);
   const timeMatch = raw.match(/\b(\d{1,2}:\d{2}(?::\d{2})?)\b/);
-  if (!timeMatch) return null;
-  const date = dateMatch?.[1] || matchDate;
-  if (date !== matchDate) return null;
+  if (!timeMatch || !date) return null;
   const tz = raw.match(/(?:Z|UTC|GMT|[+-]\d{2}:?\d{2})\b/i)?.[0];
   if (tz && !/^UTC$|^GMT$/i.test(tz)) {
     const iso = `${date}T${timeMatch[1]}${tz.toUpperCase() === 'Z' ? 'Z' : tz}`;
@@ -62,6 +87,8 @@ function cleanTeam(value: string): string {
     .replace(/[|•·]+$/g, '')
     .replace(/^[-–—:]+|[-–—:]+$/g, '')
     .replace(/\s+(?:\([^)]*\)|\[[^\]]*\])\s*$/g, '')
+    .replace(/\b(?:LIVE|preview|match preview|predicted lineup|team news|lineups?)\b/gi, '')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
@@ -71,6 +98,7 @@ function addCandidate(out: FixtureCandidate[], seen: Set<string>, fixture: strin
   if (/^(home|away|team\s*[ab]|score|odds|fixtures?|matches?|kickoff|today)$/i.test(home)) return;
   if (/^(home|away|team\s*[ab]|score|odds|fixtures?|matches?|kickoff|today)$/i.test(away)) return;
   if (/\b(?:odds|prediction|tip|result|score)\b/i.test(home) && home.length < 35) return;
+  if (/\b(?:sky sports|flashscore|soccerway|fifa world cup|today's matches|schedule|fixtures?|live score|match info|brings you)\b/i.test(home) || /\b(?:sky sports|flashscore|soccerway|fifa world cup|today's matches|schedule|fixtures?|live score|match info|brings you)\b/i.test(away)) return;
   const normalized = `${home.toLowerCase()} vs ${away.toLowerCase()}|${kickoff}`;
   if (seen.has(normalized)) return;
   seen.add(normalized);
@@ -89,11 +117,18 @@ export function extractFixtureCandidates(text: string, matchDate: string, timeZo
     if (kickoff) addCandidate(out, seen, `${m[2]} vs ${m[3]}`, kickoff, source, cleanTeam(m[4]));
   }
 
-  // Generic ISO/date-time layouts, including `2026-08-19T18:00Z` and
-  // `2026-08-19 18:00 UTC`, with the fixture on the same line.
-  const datedVs = new RegExp(`([^\\n|]{2,90}?)\\s+(?:vs\\.?|v\\.?)\\s+([^\\n|]{2,90}?)\\s+[^\\n|]{0,30}?(\\d{4}-\\d{2}-\\d{2}[^\\n|]{0,20}?(?:\\d{1,2}:\\d{2})(?:\\s*(?:UTC|GMT|Z|[+-]\\d{2}:?\\d{2}))?)`, 'gi');
+  // ISO date/time, European numeric date/time, and month-name date/time layouts.
+  const datePattern = `(?:${escapeRegExp(matchDate)}|\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4}|\\d{1,2}\\s+${monthNamesForRegex()}\\s+\\d{4}|${monthNamesForRegex()}\\s+\\d{1,2}(?:st|nd|rd|th)?[,]?\\s+\\d{4})`;
+  const datedVs = new RegExp(`([^\\n|]{2,90}?)\\s+(?:vs\\.?|v\\.?)\\s+([^\\n|]{2,90}?)(?:\\s+[^\\n|]{0,80})?(\\b${datePattern}\\b[^\\n|]{0,30}?(?:\\d{1,2}:\\d{2})(?:\\s*(?:UTC|GMT|Z|[+-]\\d{2}:?\\d{2}))?)`, 'gi');
   for (const m of input.matchAll(datedVs)) {
     const kickoff = isoFromExplicitDateTime(m[3], matchDate, timeZone);
+    if (kickoff) addCandidate(out, seen, `${m[1]} vs ${m[2]}`, kickoff, source);
+  }
+
+  // Common search-result phrase: `Brentford vs Tottenham Hotspur ... 22 Aug 2026 at 16:30`.
+  const searchPhrase = new RegExp(`([^\\n]{2,90}?)\\s+(?:vs\\.?|v\\.?)\\s+([^\\n]{2,90}?)(?:\\s+[^\\n]{0,100})?\\b(${monthNamesForRegex()}\\s+\\d{1,2}(?:st|nd|rd|th)?[,]?\\s+\\d{4}|\\d{1,2}\\s+${monthNamesForRegex()}\\s+\\d{4}|\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4})\\b[^\\n]{0,40}?\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b`, 'gi');
+  for (const m of input.matchAll(searchPhrase)) {
+    const kickoff = isoFromExplicitDateTime(`${m[3]} ${m[4]}`, matchDate, timeZone);
     if (kickoff) addCandidate(out, seen, `${m[1]} vs ${m[2]}`, kickoff, source);
   }
 
@@ -119,6 +154,10 @@ export function extractFixtureCandidates(text: string, matchDate: string, timeZo
   }
 
   return out.slice(0, 150);
+}
+
+function monthNamesForRegex(): string {
+  return '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
 }
 
 export function serializeFixtureCandidates(candidates: FixtureCandidate[]): string {
