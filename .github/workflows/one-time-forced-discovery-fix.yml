@@ -1,0 +1,48 @@
+name: One-time forced discovery fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-time-forced-discovery-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch orchestrator discovery gate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('server/agent/orchestrator.ts')
+          s = p.read_text()
+          old = """export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(step:ReActStep)=>void):Promise<OrchestratorResult>{const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};const parsed=await parseQuery(userQuery);let fixtures:DiscoveredFixture[]=[];let schedule='';if(parsed.fixture==='multiple/open'||parsed.fixture===userQuery){const d=await discoverFixtures(userQuery,parsed.sport,parsed.matchDate,emit);fixtures=d.fixtures;schedule=d.rawSchedule;}else fixtures=[{fixture:parsed.fixture,status:'scheduled'}];if(!fixtures.length)return{finalAnswer:`NO QUALIFIED FIXTURES: No clean future fixtures were verified for ${parsed.matchDate}.`,steps,success:true,metadata:{fixture:'',sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:[]}};"""
+          new = """export async function runOrchestrator(userQuery:string,sessionId:string,onStep:(step:ReActStep)=>void):Promise<OrchestratorResult>{const steps:ReActStep[]=[];const emit=(s:ReActStep)=>{const x={...s,timestamp:new Date().toISOString()};steps.push(x);onStep(x);};const parsed=await parseQuery(userQuery);let fixtures:DiscoveredFixture[]=[];let schedule='';emit({type:'status',content:`🔒 Mandatory discovery gate engaged for ${parsed.sport} on ${parsed.matchDate}. Search is required before fixture qualification.`});const d=await discoverFixtures(userQuery,parsed.sport,parsed.matchDate,emit);fixtures=d.fixtures;schedule=d.rawSchedule;const explicitFixture=parsed.fixture!=='multiple/open'&&parsed.fixture!==userQuery?normalizeFixtureName(parsed.fixture):'';if(explicitFixture){const matches=fixtures.filter(f=>normalizeFixtureName(f.fixture)===explicitFixture);if(matches.length)fixtures=matches;}if(!fixtures.length)return{finalAnswer:`NO QUALIFIED FIXTURES: Discovery/search completed but no clean future fixtures were verified for ${parsed.matchDate}.`,steps,success:true,metadata:{fixture:'',sport:parsed.sport,market:parsed.market,matchDate:parsed.matchDate,fixtures:[],discoveryAttempted:true,searchRequired:true}};"""
+          if old not in s:
+              raise SystemExit('Expected orchestrator block not found; refusing to patch')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Verify patch
+        run: |
+          grep -F "Mandatory discovery gate engaged" server/agent/orchestrator.ts
+          grep -F "discoveryAttempted:true" server/agent/orchestrator.ts
+      - name: Commit patch and remove one-time workflow
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/agent/orchestrator.ts .github/workflows/one-time-forced-discovery-fix.yml
+          git commit -m 'fix: force fixture discovery before accumulator gate'
+          git rm .github/workflows/one-time-forced-discovery-fix.yml
+          git commit -m 'chore: remove one-time discovery patch workflow'
+          git push
+
+# Force a fresh push event so the one-time repair job executes.
