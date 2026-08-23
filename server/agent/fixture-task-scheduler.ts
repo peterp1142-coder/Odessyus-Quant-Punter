@@ -8,9 +8,9 @@ const MAX_QUEUE_WAIT_MS = Math.max(15_000, Number(process.env.AGENT_MAX_QUEUE_WA
 const MAX_QUEUE_DEPTH = Math.max(100, Number(process.env.AGENT_MAX_QUEUE_DEPTH || 150));
 
 function cleanFixtureLabel(value:string):string {
-  const raw=value.replace(/\\[[^\\]]*\\]\\((https?:\\/\\/[^)]+)\\)/g,'$1').replace(/\\s+/g,' ').trim();
-  const candidate=(raw.split(/\\s*(?:\\n|\\|)\\s*/).find(x=>/\\b(?:vs\\.?|v\\.?)\\b/i.test(x))||raw);
-  const m=candidate.match(/^(.{2,100}?)\\s+(?:vs\\.?|v\\.?)\\s+(.{2,100}?)(?=\\s+(?:\\d{1,2}:\\d{2}|\\d{4}-\\d{2}-\\d{2}|league|competition|$))/i);
+  const raw=value.replace(/\[[^\]]*\]\((https?:\/\/[^)]+)\)/g,'$1').replace(/\s+/g,' ').trim();
+  const candidate=(raw.split(/\s*(?:\n|\|)\s*/).find(x=>/\b(?:vs\.?|v\.?)\b/i.test(x))||raw);
+  const m=candidate.match(/^(.{2,100}?)\s+(?:vs\.?|v\.?)\s+(.{2,100}?)(?=\s+(?:\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|league|competition|$))/i);
   return m?`${m[1].trim()} vs ${m[2].trim()}`:candidate.slice(0,180);
 }
 
