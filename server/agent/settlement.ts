@@ -1,172 +1,45 @@
-/**
- * Exact-market prediction settlement.
- * Missing selections are never guessed; unsupported markets go to manual review.
- */
-
+/** Exact-market settlement with rolling historical backfill. */
 import cron from 'node-cron';
 import { query } from '../db/index.js';
 import { logResult } from './airtable-logger.js';
 import { allSportsLivescore } from './tools.js';
 import { fetchFinishedScores } from './final-score.js';
 
-interface PendingPick {
-  id: string;
-  fixture: string;
-  prediction_market: string;
-  prediction_selection: string | null;
-  goal_statement: string | null;
-  event_date: Date | null;
-  recommended_odds: number | null;
-  created_at: Date;
-}
+interface Pick { id:string; fixture:string; prediction_market:string; prediction_selection:string|null; goal_statement:string|null; event_date:Date|null; recommended_odds:number|null; created_at:Date; status:string; }
+interface Score { homeScore:number; awayScore:number; status:string; found:boolean; }
+type Outcome='won'|'lost'|'void'|'half_win'|'half_loss'|'push'|'manual_review';
+interface Settlement { outcome:Outcome; actualOutcome:string; voidReason?:string; roi:number; }
 
-interface ScoreResult { homeScore:number; awayScore:number; status:string; found:boolean; }
-interface SettlementResult { outcome:'won'|'lost'|'void'|'half_win'|'half_loss'|'push'|'manual_review'; actualOutcome:string; voidReason?:string; roi:number; }
+const BACKFILL_DAYS=Math.max(3,Number(process.env.SETTLEMENT_BACKFILL_DAYS||7));
+const SCORE_CACHE=new Map<string,string>();
+const FINISHED=new Set(['Finished','FT','Full Time','Match Finished','AP','AET','final','FINISHED','FT (PEN)']);
 
-const INITIAL_DELAY_HOURS = 2;
-const MAX_RETRY_HOURS = 6;
+async function ensureColumn(){const r=await query<any[]>(`SELECT COUNT(*) column_exists FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='predictions' AND column_name='prediction_selection'`);if(Number(r[0]?.column_exists||0))return;try{await query(`ALTER TABLE predictions ADD COLUMN prediction_selection VARCHAR(500) NULL`);}catch(e){if((e as any)?.code!=='ER_DUP_FIELDNAME')throw e;}}
 
-async function ensurePredictionSelectionColumn(): Promise<void> {
-  const rows = await query<Array<{ column_exists: number }>>(`
-    SELECT COUNT(*) AS column_exists
-    FROM information_schema.columns
-    WHERE table_schema = DATABASE()
-      AND table_name = 'predictions'
-      AND column_name = 'prediction_selection'
-  `);
+export function initSettlementCron(){void ensureColumn().catch(e=>console.error('[Settlement] migration:',e));cron.schedule('*/30 * * * *',()=>void runSettlementPass().catch(e=>console.error('[Settlement] pass:',e)));setTimeout(()=>void runSettlementPass().catch(e=>console.error('[Settlement] startup:',e)),60_000);console.log(`[Settlement] Cron job scheduled (every 30 min) + ${BACKFILL_DAYS}-day rolling backfill`);}
 
-  if (Number(rows[0]?.column_exists || 0) > 0) return;
+function datesBetween(start:Date,end:Date){const out:string[]=[];for(let d=new Date(start);d<=end;d.setUTCDate(d.getUTCDate()+1))out.push(d.toISOString().slice(0,10));return out;}
+function dateKey(d:Date){return d.toISOString().slice(0,10);}
+function norm(v:string){return v.toLowerCase().replace(/\b(?:fc|afc|cf|sc|ac)\b/g,'').replace(/[^a-z0-9]+/g,' ').trim();}
+function splitFixture(f:string):[string,string]{const m=f.match(/^(.{2,100}?)\s+(?:vs\.?|v\.?)\s+(.{2,100}?)$/i);return [m?.[1]?.trim()||'',m?.[2]?.trim()||''];}
+function sameTeam(a:string,b:string){const x=norm(a),y=norm(b);return x===y||x.includes(y)||y.includes(x);}
 
-  try {
-    await query(`ALTER TABLE predictions ADD COLUMN prediction_selection VARCHAR(500) NULL`);
-  } catch (err) {
-    const code = (err as { code?: string })?.code;
-    if (code !== 'ER_DUP_FIELDNAME') throw err;
-  }
-}
+async function scoreFeed(date:string){if(SCORE_CACHE.has(date))return SCORE_CACHE.get(date)!;const r=await fetchFinishedScores(date,date).catch(()=>({success:false,data:''}));const data=r.success?r.data:'';SCORE_CACHE.set(date,data);return data;}
+async function fetchScore(fixture:string,eventDate:Date|null):Promise<Score>{const [home,away]=splitFixture(fixture);if(!home||!away)return{homeScore:-1,awayScore:-1,status:'',found:false};const base=eventDate?new Date(eventDate):new Date();const start=new Date(base);start.setUTCDate(start.getUTCDate()-1);const end=new Date(base);end.setUTCDate(end.getUTCDate()+1);for(const date of datesBetween(start,end)){for(const line of (await scoreFeed(date)).split('\n')){const p=line.split(' | ').map(v=>v.trim());const lh=p[2]||'',la=p[3]||'',hs=Number(p[4]),as=Number(p[5]),st=p[6]||'FT';if(!Number.isFinite(hs)||!Number.isFinite(as))continue;if(sameTeam(lh,home)&&sameTeam(la,away))return{homeScore:hs,awayScore:as,status:st,found:true};}}if(eventDate&&Math.abs(Date.now()-eventDate.getTime())<36*3600_000){const live=await allSportsLivescore().catch(()=>({success:false,data:''} as any));if(live.success){const h=norm(home),a=norm(away);for(const line of String(live.data).split('\n')){const n=norm(line);if(n.includes(h)&&n.includes(a)){const m=line.match(/(\d+)\s*[-:]\s*(\d+)/);if(m)return{homeScore:Number(m[1]),awayScore:Number(m[2]),status:'FT',found:true};}}}}return{homeScore:-1,awayScore:-1,status:'',found:false};}
 
-export function initSettlementCron(): void {
-  void ensurePredictionSelectionColumn().catch(err => console.error('[Settlement] Selection-column migration error:', err instanceof Error ? err.message : String(err)));
-  console.log('[Settlement] Cron job scheduled (every 30 min)');
-  cron.schedule('*/30 * * * *', async () => {
-    try { await runSettlementPass(); }
-    catch (err) { console.error('[Settlement] Error:', err instanceof Error ? err.message : String(err)); }
-  });
-  setTimeout(() => { void runSettlementPass().catch(err => console.error('[Settlement] Startup pass error:', err instanceof Error ? err.message : String(err))); }, 60_000);
-}
+function selection(p:Pick){if(p.prediction_selection?.trim())return p.prediction_selection.trim();try{const x=JSON.parse(p.goal_statement||'');const s=x?.primaryBet?.selection||x?.primaryBet?.pick||x?.primaryBet?.name;return typeof s==='string'&&s.trim()?s.trim():null;}catch{return null;}}
+function settle(market:string,sel:string|null,home:number,away:number):Settlement{const m=market.toLowerCase(),s=(sel||'').toLowerCase(),t=home+away,hw=home>away,aw=away>home,d=home===away;if(!s)return{outcome:'manual_review',actualOutcome:'missing_selection',voidReason:`Missing exact selection for ${market}`,roi:0};
+ if(m.includes('1x2')||m.includes('match result')||m==='result'){if(/\b(home|home win|1)\b/.test(s))return hw?{outcome:'won',actualOutcome:'home_win',roi:0}:{outcome:'lost',actualOutcome:d?'draw':'away_win',roi:-1};if(/\b(away|away win|2)\b/.test(s))return aw?{outcome:'won',actualOutcome:'away_win',roi:0}:{outcome:'lost',actualOutcome:d?'draw':'home_win',roi:-1};if(/^draw$/.test(s))return d?{outcome:'won',actualOutcome:'draw',roi:0}:{outcome:'lost',actualOutcome:hw?'home_win':'away_win',roi:-1};}
+ if(m.includes('dnb')||m.includes('draw no bet')){if(/\bhome\b/.test(s))return hw?{outcome:'won',actualOutcome:'home_win',roi:0}:d?{outcome:'void',actualOutcome:'draw',voidReason:'DNB draw refund',roi:0}:{outcome:'lost',actualOutcome:'away_win',roi:-1};if(/\baway\b/.test(s))return aw?{outcome:'won',actualOutcome:'away_win',roi:0}:d?{outcome:'void',actualOutcome:'draw',voidReason:'DNB draw refund',roi:0}:{outcome:'lost',actualOutcome:'home_win',roi:-1};}
+ if(m.includes('btts')||m.includes('both teams')){const yes=home>0&&away>0;if(/\byes\b/.test(s))return yes?{outcome:'won',actualOutcome:'btts_yes',roi:0}:{outcome:'lost',actualOutcome:'btts_no',roi:-1};if(/\bno\b/.test(s))return !yes?{outcome:'won',actualOutcome:'btts_no',roi:0}:{outcome:'lost',actualOutcome:'btts_yes',roi:-1};}
+ if(/under\s*2\.5/.test(`${m} ${s}`))return t<3?{outcome:'won',actualOutcome:'under_2.5',roi:0}:{outcome:'lost',actualOutcome:'over_2.5',roi:-1};
+ if(/over\s*2\.5/.test(`${m} ${s}`))return t>2?{outcome:'won',actualOutcome:'over_2.5',roi:0}:{outcome:'lost',actualOutcome:'under_2.5',roi:-1};
+ if(/under\s*3\.5/.test(`${m} ${s}`))return t<4?{outcome:'won',actualOutcome:'under_3.5',roi:0}:{outcome:'lost',actualOutcome:'over_3.5',roi:-1};
+ if(/over\s*3\.5/.test(`${m} ${s}`))return t>3?{outcome:'won',actualOutcome:'over_3.5',roi:0}:{outcome:'lost',actualOutcome:'under_3.5',roi:-1};
+ if(m.includes('double chance')||/^(1x|x2|12)$/.test(s)){if(s==='1x')return hw||d?{outcome:'won',actualOutcome:'1x',roi:0}:{outcome:'lost',actualOutcome:'away_win',roi:-1};if(s==='x2')return aw||d?{outcome:'won',actualOutcome:'x2',roi:0}:{outcome:'lost',actualOutcome:'home_win',roi:-1};if(s==='12')return !d?{outcome:'won',actualOutcome:'12',roi:0}:{outcome:'lost',actualOutcome:'draw',roi:-1};}
+ if(m.includes('asian')||m.includes('handicap')||/[+-]\s*\d+(?:\.\d+)?/.test(s)){const mt=`${m} ${s}`.match(/([+-]?\d+(?:\.\d+)?)/);if(!mt)return{outcome:'manual_review',actualOutcome:'unknown_ah',roi:0};const line=Number(mt[1]),isAway=/\baway\b/.test(`${m} ${s}`),margin=isAway?away-home+line:home-away+line;if(margin>0)return{outcome:'won',actualOutcome:'asian_win',roi:0};if(margin<0)return{outcome:'lost',actualOutcome:'asian_loss',roi:-1};return{outcome:'push',actualOutcome:'asian_push',voidReason:'Asian handicap push',roi:0};}
+ return{outcome:'manual_review',actualOutcome:'unsupported_market',voidReason:`Unsupported market: ${market}`,roi:0};}
 
-async function runSettlementPass(): Promise<void> {
-  await ensurePredictionSelectionColumn();
-  const pending = await query<PendingPick[]>(`
-    SELECT id, fixture, prediction_market, prediction_selection, goal_statement, event_date, recommended_odds, created_at
-    FROM predictions
-    WHERE status = 'pending' AND event_date IS NOT NULL
-    ORDER BY event_date ASC
-    LIMIT 500
-  `);
-  const now = Date.now();
-  for (const pick of pending) {
-    const kickoff = pick.event_date ? new Date(pick.event_date).getTime() : new Date(pick.created_at).getTime();
-    const hoursSinceKickoff = (now - kickoff) / 3_600_000;
-    if (hoursSinceKickoff < INITIAL_DELAY_HOURS) continue;
-    if (hoursSinceKickoff > MAX_RETRY_HOURS + 24) { await flagManualReview(pick.id, 'Exceeded retry window — no final score found within 30h'); continue; }
-    const score = await fetchScore(pick.fixture, pick.event_date);
-    if (!score.found) { if (hoursSinceKickoff > MAX_RETRY_HOURS) await flagManualReview(pick.id, 'No final score found after 6h retry window'); continue; }
-    if (score.status && !['Finished','FT','Full Time','Match Finished','AP','AET','final'].includes(score.status)) continue;
-    const selection = resolveSelection(pick);
-    const settlement = settleMarket(pick.prediction_market, selection, score.homeScore, score.awayScore);
-    await applySettlement(pick, settlement, score, selection);
-  }
-}
+async function apply(p:Pick,r:Settlement,score:Score,sel:string|null){let roi=r.roi;const odds=Number(p.recommended_odds)||0;if(r.outcome==='won'&&odds>1)roi=odds-1;if(r.outcome==='half_win'&&odds>1)roi=(odds-1)/2;await query(`UPDATE predictions SET status=?,actual_result=?,roi=?,closing_odds=COALESCE(closing_odds,recommended_odds) WHERE id=?`,[r.outcome,r.actualOutcome,roi,p.id]);await logResult({predictionId:p.id,fixture:p.fixture,market:p.prediction_market,selection:sel||'',actualOutcome:r.actualOutcome,result:r.outcome,voidReason:r.voidReason||'',finalScore:`${score.homeScore}-${score.awayScore}`,roi}).catch(e=>console.error('[Settlement] log:',e));console.log(`[Settlement] ${p.fixture} | ${sel||'MISSING'} -> ${r.outcome} | ${score.homeScore}-${score.awayScore}`);}
 
-function resolveSelection(pick: PendingPick): string | null {
-  if (pick.prediction_selection?.trim()) return pick.prediction_selection.trim();
-  if (pick.goal_statement) {
-    try {
-      const parsed = JSON.parse(pick.goal_statement);
-      const value = parsed?.primaryBet?.selection || parsed?.primaryBet?.pick || parsed?.primaryBet?.name;
-      if (typeof value === 'string' && value.trim()) return value.trim();
-    } catch {}
-  }
-  return null;
-}
-
-function splitFixture(fixture:string): [string,string] {
-  const p = fixture.split(/\s+(?:vs\.?|v\.?)\s+/i).map(v=>v.trim()).filter(Boolean);
-  return [p[0] || '', p[1] || ''];
-}
-function normTeam(value:string):string { return value.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); }
-
-async function fetchScore(fixture:string,eventDate:Date|null):Promise<ScoreResult> {
-  const [home,away] = splitFixture(fixture); if (!home || !away) return {homeScore:-1,awayScore:-1,status:'',found:false};
-  const date = eventDate ? new Date(eventDate).toISOString().slice(0,10) : new Date().toISOString().slice(0,10);
-  const h = normTeam(home), a = normTeam(away);
-  const finished = await fetchFinishedScores(date,date).catch(()=>({success:false,data:''}));
-  if (finished.success) {
-    for (const line of finished.data.split('\n')) {
-      const p=line.split(' | ').map(v=>v.trim());
-      const lh=normTeam(p[2]||''), la=normTeam(p[3]||''); const hs=Number(p[4]), as=Number(p[5]);
-      if (!Number.isFinite(hs)||!Number.isFinite(as)) continue;
-      if ((lh===h&&la===a)||(lh.includes(h)&&la.includes(a))) return {homeScore:hs,awayScore:as,status:p[6]||'FT',found:true};
-    }
-  }
-  const live = await allSportsLivescore().catch(()=>({success:false,data:''} as any));
-  if (live.success) {
-    for (const line of String(live.data).split('\n')) {
-      const n=normTeam(line); if (!n.includes(h)||!n.includes(a)) continue;
-      const m=line.match(/(\d+)\s*[-:]\s*(\d+)/); if (m) return {homeScore:Number(m[1]),awayScore:Number(m[2]),status:'FT',found:true};
-    }
-  }
-  return {homeScore:-1,awayScore:-1,status:'',found:false};
-}
-
-function settleMarket(market:string,selection:string|null,home:number,away:number):SettlementResult {
-  const m=market.toLowerCase().trim(), s=String(selection||'').toLowerCase().trim();
-  if (!s) return {outcome:'manual_review',actualOutcome:'missing_selection',voidReason:`Missing exact selection for market: ${market}`,roi:0};
-  const total=home+away, homeWin=home>away, awayWin=away>home, draw=home===away;
-  const homeSel=/\b(home|home win|1)\b/.test(s), awaySel=/\b(away|away win|2)\b/.test(s), drawSel=/^draw$/.test(s);
-
-  if (m.includes('1x2')||m.includes('match result')||m==='result') {
-    if(homeSel)return homeWin?{outcome:'won',actualOutcome:'home_win',roi:0}:{outcome:'lost',actualOutcome:draw?'draw':'away_win',roi:-1};
-    if(awaySel)return awayWin?{outcome:'won',actualOutcome:'away_win',roi:0}:{outcome:'lost',actualOutcome:draw?'draw':'home_win',roi:-1};
-    if(drawSel)return draw?{outcome:'won',actualOutcome:'draw',roi:0}:{outcome:'lost',actualOutcome:homeWin?'home_win':'away_win',roi:-1};
-    return {outcome:'manual_review',actualOutcome:'unknown_1x2_selection',voidReason:`Unrecognized 1X2 selection: ${selection}`,roi:0};
-  }
-  if(m.includes('dnb')||m.includes('draw no bet')) {
-    if(homeSel)return homeWin?{outcome:'won',actualOutcome:'home_win',roi:0}:draw?{outcome:'void',actualOutcome:'draw',voidReason:'DNB — draw refunds stake',roi:0}:{outcome:'lost',actualOutcome:'away_win',roi:-1};
-    if(awaySel)return awayWin?{outcome:'won',actualOutcome:'away_win',roi:0}:draw?{outcome:'void',actualOutcome:'draw',voidReason:'DNB — draw refunds stake',roi:0}:{outcome:'lost',actualOutcome:'home_win',roi:-1};
-    return {outcome:'manual_review',actualOutcome:'unknown_dnb_selection',voidReason:`Unrecognized DNB selection: ${selection}`,roi:0};
-  }
-  if(m.includes('btts')||m.includes('both teams')) { const yes=home>0&&away>0; if(/\byes\b/.test(s))return yes?{outcome:'won',actualOutcome:'btts_yes',roi:0}:{outcome:'lost',actualOutcome:'btts_no',roi:-1}; if(/\bno\b/.test(s))return !yes?{outcome:'won',actualOutcome:'btts_no',roi:0}:{outcome:'lost',actualOutcome:'btts_yes',roi:-1}; return {outcome:'manual_review',actualOutcome:'unknown_btts_selection',voidReason:`Unrecognized BTTS selection: ${selection}`,roi:0}; }
-  if(/under\s*2\.5/.test(`${m} ${s}`))return total<2.5?{outcome:'won',actualOutcome:'under_2.5',roi:0}:{outcome:'lost',actualOutcome:'over_2.5',roi:-1};
-  if(/over\s*2\.5/.test(`${m} ${s}`))return total>2.5?{outcome:'won',actualOutcome:'over_2.5',roi:0}:{outcome:'lost',actualOutcome:'under_2.5',roi:-1};
-  if(/under\s*3\.5/.test(`${m} ${s}`))return total<3.5?{outcome:'won',actualOutcome:'under_3.5',roi:0}:{outcome:'lost',actualOutcome:'over_3.5',roi:-1};
-  if(/over\s*3\.5/.test(`${m} ${s}`))return total>3.5?{outcome:'won',actualOutcome:'over_3.5',roi:0}:{outcome:'lost',actualOutcome:'under_3.5',roi:-1};
-  if(m.includes('double chance')||/^(1x|x2|12)$/.test(s)) { if(s==='1x')return homeWin||draw?{outcome:'won',actualOutcome:'1x',roi:0}:{outcome:'lost',actualOutcome:'away_win',roi:-1}; if(s==='x2')return awayWin||draw?{outcome:'won',actualOutcome:'x2',roi:0}:{outcome:'lost',actualOutcome:'home_win',roi:-1}; if(s==='12')return !draw?{outcome:'won',actualOutcome:'12',roi:0}:{outcome:'lost',actualOutcome:'draw',roi:-1}; return {outcome:'manual_review',actualOutcome:'unknown_double_chance_selection',voidReason:`Unrecognized double chance selection: ${selection}`,roi:0}; }
-  if(m.includes('asian')||m.includes('handicap')||/[+-]\s*\d+(?:\.\d+)?/.test(s)) return settleAsianHandicap(`${market} ${selection}`,home,away);
-  return {outcome:'manual_review',actualOutcome:'unsupported_market',voidReason:`Automatic settlement not implemented for: ${market} / ${selection}`,roi:0};
-}
-
-function settleAsianHandicap(text:string,home:number,away:number):SettlementResult {
-  const t=text.toLowerCase(); const match=t.match(/([+-]?\d+(?:\.\d+)?)/); if(!match)return{outcome:'manual_review',actualOutcome:'unknown_ah',voidReason:'Could not parse handicap line',roi:0};
-  const line=Number(match[1]), isAway=t.includes('away'), margin=isAway?away-home+line:home-away+line;
-  if(margin>0.25)return{outcome:'won',actualOutcome:`ah_${isAway?'away':'home'}_${line}`,roi:0};
-  if(margin<-0.25)return{outcome:'lost',actualOutcome:`ah_${isAway?'away':'home'}_${line}`,roi:-1};
-  if(margin===0)return{outcome:'push',actualOutcome:`ah_${isAway?'away':'home'}_${line}`,voidReason:'Asian Handicap push — stake refunded',roi:0};
-  if(margin===0.25)return{outcome:'half_win',actualOutcome:`ah_${isAway?'away':'home'}_${line}`,voidReason:'Asian Handicap half-win',roi:0.5};
-  if(margin===-0.25)return{outcome:'half_loss',actualOutcome:`ah_${isAway?'away':'home'}_${line}`,voidReason:'Asian Handicap half-loss',roi:-0.5};
-  return{outcome:'manual_review',actualOutcome:'unresolved_ah',voidReason:`Unresolved handicap margin: ${margin}`,roi:0};
-}
-
-async function applySettlement(pick:PendingPick,settlement:SettlementResult,score:ScoreResult,selection:string|null):Promise<void> {
-  const odds=Number(pick.recommended_odds)||0; let roi=settlement.roi;
-  if(settlement.outcome==='won'&&odds>1)roi=odds-1;
-  if(settlement.outcome==='half_win'&&odds>1)roi=(odds-1)*0.5;
-  if(settlement.outcome==='half_loss')roi=-0.5;
-  const status=settlement.outcome==='manual_review'?'manual_review':settlement.outcome;
-  await query(`UPDATE predictions SET status=?,actual_result=?,roi=?,closing_odds=COALESCE(closing_odds,recommended_odds) WHERE id=?`,[status,settlement.actualOutcome,roi,pick.id]);
-  await logResult({predictionId:pick.id,fixture:pick.fixture,market:pick.prediction_market,selection:selection||'',actualOutcome:settlement.actualOutcome,result:settlement.outcome,voidReason:settlement.voidReason||'',finalScore:`${score.homeScore}-${score.awayScore}`,roi}).catch(err=>console.error('[Settlement] Airtable log error:',err instanceof Error?err.message:String(err)));
-  console.log(`[Settlement] ${pick.fixture} | ${pick.prediction_market} | ${selection||'MISSING'} -> ${settlement.outcome} | ${score.homeScore}-${score.awayScore} | ROI ${roi}`);
-}
-
-async function flagManualReview(predictionId:string,reason:string):Promise<void> { await query('UPDATE predictions SET status=? WHERE id=?',['manual_review',predictionId]); await logResult({predictionId,fixture:'',market:'',selection:'',actualOutcome:'no_score',result:'manual_review',voidReason:reason,finalScore:'',roi:0}).catch(()=>{}); console.warn(`[Settlement] ${predictionId} manual review: ${reason}`); }
+async function runSettlementPass(){await ensureColumn();const now=new Date();const from=new Date(now);from.setUTCDate(from.getUTCDate()-BACKFILL_DAYS);const to=new Date(now);to.setUTCDate(to.getUTCDate()+1);const pending=await query<Pick[]>(`SELECT id,fixture,prediction_market,prediction_selection,goal_statement,event_date,recommended_odds,created_at,status FROM predictions WHERE event_date IS NOT NULL AND event_date BETWEEN ? AND ? AND status IN ('pending','manual_review') ORDER BY event_date ASC LIMIT 1000`,[from,to]);for(const p of pending){if(p.status==='manual_review' && p.actual_result && p.actual_result!=='no_score')continue;const kickoff=p.event_date?new Date(p.event_date):new Date(p.created_at);if(kickoff.getTime()>Date.now()-90*60_000)continue;const score=await fetchScore(p.fixture,p.event_date);if(!score.found||!FINISHED.has(score.status))continue;const sel=selection(p);if(!sel){await query(`UPDATE predictions SET status='manual_review',actual_result='missing_selection' WHERE id=?`,[p.id]);continue;}await apply(p,settle(p.prediction_market,sel,score.homeScore,score.awayScore),score,sel);}SCORE_CACHE.clear();}
